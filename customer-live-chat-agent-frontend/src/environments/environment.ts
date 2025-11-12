@@ -1,6 +1,6 @@
 export const environment = {
   production: false,
-  apiBaseUrl: 'http://localhost:8383',
-  socketUrl: 'http://localhost:9094'
+  apiBaseUrl: 'http://172.16.206.55:8383',
+  socketUrl: 'http://172.16.206.55:9094'
 };
 

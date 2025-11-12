@@ -26,6 +26,11 @@ interface StoredCustomerSession {
   displayName: string;
 }
 
+interface StoredConversationState {
+  conversation: ConversationMetadata;
+  customerId: string;
+}
+
 @Component({
   selector: 'app-root',
   standalone: true,
@@ -43,7 +48,9 @@ export class AppComponent implements OnInit, OnDestroy {
 
   readonly isWidgetOpen = signal(false);
   readonly stage = signal(ChatStage.Idle);
-  readonly statusText = signal('Need a hand? Start a chat with us.');
+  private readonly greetingText = 'Hi there! How can we help you today?';
+
+  readonly statusText = signal(this.greetingText);
   readonly errorText = signal<string | null>(null);
   readonly messages = signal<ChatMessage[]>([]);
   readonly queueStatus = signal<QueueStatusResponse | null>(null);
@@ -61,10 +68,13 @@ export class AppComponent implements OnInit, OnDestroy {
   private readonly activeSubscriptions: Subscription[] = [];
   private readonly fingerprint = this.ensureFingerprint();
   private session!: StoredCustomerSession;
+  private readonly activeConversationKey = 'customer-chat-active-conversation';
 
   ngOnInit(): void {
     this.session = this.ensureSession();
     this.setComposerEnabled(false);
+    this.openWidget();
+    this.restoreActiveConversation();
   }
 
   ngOnDestroy(): void {
@@ -77,7 +87,7 @@ export class AppComponent implements OnInit, OnDestroy {
     if (!this.isWidgetOpen()) {
       this.isWidgetOpen.set(true);
     }
-    if (this.stage() === ChatStage.Idle || this.stage() === ChatStage.Ended) {
+    if (this.stage() === ChatStage.Idle) {
       this.stage.set(ChatStage.Confirm);
     }
   }
@@ -92,7 +102,7 @@ export class AppComponent implements OnInit, OnDestroy {
     }
     this.errorText.set(null);
     this.stage.set(ChatStage.Connecting);
-    this.statusText.set('Starting a new conversation...');
+    this.statusText.set('Connecting you with our support team...');
 
     const payload: CreateConversationPayload = {
       channel: 'web',
@@ -107,6 +117,7 @@ export class AppComponent implements OnInit, OnDestroy {
           const customerId = conversation.customer?.id ?? this.session.token;
           this.participantId.set(customerId);
           this.conversation.set(conversation);
+          this.persistActiveConversation(conversation, customerId);
           this.messages.set([
             this.createSystemMessage(
               conversation.id,
@@ -182,10 +193,11 @@ export class AppComponent implements OnInit, OnDestroy {
     this.queueStatus.set(null);
     this.conversation.set(null);
     this.participantId.set(null);
-    this.statusText.set('Need a hand? Start a chat with us.');
+    this.statusText.set(this.greetingText);
     this.errorText.set(null);
     this.stage.set(ChatStage.Confirm);
     this.setComposerEnabled(false);
+    this.clearStoredActiveConversation();
   }
 
   trackByMessageId(_index: number, item: ChatMessage): string {
@@ -242,6 +254,7 @@ export class AppComponent implements OnInit, OnDestroy {
       this.socket.onHandshake().subscribe((handshake: SocketHandshake) => {
         this.conversation.set(handshake.conversation);
         this.participantId.set(handshake.participant.id);
+        this.persistActiveConversation(handshake.conversation, handshake.participant.id);
         this.loadHistory(handshake.conversation.id);
       })
     );
@@ -288,6 +301,7 @@ export class AppComponent implements OnInit, OnDestroy {
       this.socket.disconnect();
       this.clearSocketSubscriptions();
       this.clearActiveSubscriptions();
+      this.clearStoredActiveConversation();
     }
 
     this.messages.update((current) => this.mergeMessages(current, [normalized]));
@@ -353,7 +367,7 @@ export class AppComponent implements OnInit, OnDestroy {
     } catch (error) {
       console.warn('Unable to read fingerprint from storage', error);
     }
-    const generated = crypto.randomUUID();
+    const generated = this.generateUuid();
     try {
       localStorage.setItem(storageKey, generated);
     } catch (error) {
@@ -376,7 +390,7 @@ export class AppComponent implements OnInit, OnDestroy {
       console.warn('Failed to restore stored session', error);
     }
     const session: StoredCustomerSession = {
-      token: crypto.randomUUID(),
+      token: this.generateUuid(),
       displayName: 'Visitor'
     };
     try {
@@ -413,5 +427,88 @@ export class AppComponent implements OnInit, OnDestroy {
     } else if (this.messageForm.enabled) {
       this.messageForm.disable({ emitEvent: false });
     }
+  }
+
+  private restoreActiveConversation(): void {
+    const stored = this.readStoredActiveConversation();
+    if (!stored) {
+      return;
+    }
+
+    try {
+      this.isWidgetOpen.set(true);
+      this.stage.set(ChatStage.Waiting);
+      this.statusText.set('Restoring your conversation...');
+      this.queueStatus.set(null);
+      this.messages.set([]);
+      this.conversation.set(stored.conversation);
+      this.participantId.set(stored.customerId);
+      this.setComposerEnabled(false);
+      this.connectSocket(stored.conversation, stored.customerId);
+    } catch (error) {
+      console.warn('Unable to restore customer conversation', error);
+      this.clearStoredActiveConversation();
+    }
+  }
+
+  private persistActiveConversation(conversation: ConversationMetadata, customerId: string): void {
+    try {
+      const state: StoredConversationState = {
+        conversation,
+        customerId
+      };
+      localStorage.setItem(this.activeConversationKey, JSON.stringify(state));
+    } catch (error) {
+      console.warn('Unable to persist active conversation', error);
+    }
+  }
+
+  private clearStoredActiveConversation(): void {
+    try {
+      localStorage.removeItem(this.activeConversationKey);
+    } catch (error) {
+      console.warn('Unable to clear stored conversation', error);
+    }
+  }
+
+  private readStoredActiveConversation(): StoredConversationState | null {
+    try {
+      const raw = localStorage.getItem(this.activeConversationKey);
+      if (!raw) {
+        return null;
+      }
+      const parsed = JSON.parse(raw) as StoredConversationState;
+      if (parsed?.conversation?.id && parsed?.customerId) {
+        return parsed;
+      }
+    } catch (error) {
+      console.warn('Failed to parse stored conversation', error);
+    }
+    return null;
+  }
+
+  private generateUuid(): string {
+    const cryptoObj: Crypto | undefined = globalThis.crypto;
+
+    if (cryptoObj?.randomUUID) {
+      return cryptoObj.randomUUID();
+    }
+
+    if (cryptoObj?.getRandomValues) {
+      const buffer = new Uint8Array(16);
+      cryptoObj.getRandomValues(buffer);
+
+      buffer[6] = (buffer[6] & 0x0f) | 0x40;
+      buffer[8] = (buffer[8] & 0x3f) | 0x80;
+
+      const hex = Array.from(buffer, (byte) => byte.toString(16).padStart(2, '0')).join('');
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (char) => {
+      const random = Math.random() * 16;
+      const value = char === 'x' ? random : (random & 0x3) | 0x8;
+      return Math.floor(value).toString(16);
+    });
   }
 }

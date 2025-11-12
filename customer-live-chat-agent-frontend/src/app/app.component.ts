@@ -1,13 +1,15 @@
 import { CommonModule } from '@angular/common';
-import { ChangeDetectionStrategy, Component, OnDestroy, OnInit, signal, inject } from '@angular/core';
-import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
+import { HttpErrorResponse } from '@angular/common/http';
+import { ChangeDetectionStrategy, Component, OnDestroy, OnInit, computed, inject, signal } from '@angular/core';
+import { FormBuilder, FormGroup, ReactiveFormsModule, Validators } from '@angular/forms';
 import { Subscription, catchError, interval, of, startWith, switchMap, take } from 'rxjs';
 import { ChatApiService } from './chat-api.service';
-import { ChatSocketService } from './chat-socket.service';
+import { AgentSocketConnection, ChatSocketService } from './chat-socket.service';
 import { ChatMessage, ConversationMetadata, QueueEntry } from './models';
 
 enum AgentStage {
   Idle = 'IDLE',
+  Connecting = 'CONNECTING',
   Active = 'ACTIVE',
   Ended = 'ENDED'
 }
@@ -15,6 +17,20 @@ enum AgentStage {
 interface AgentSession {
   agentId: string;
   displayName: string;
+}
+
+interface AgentChatSession {
+  id: string;
+  conversation: ConversationMetadata | null;
+  stage: AgentStage;
+  statusText: string;
+  messages: ChatMessage[];
+  messageForm: FormGroup;
+  isSending: boolean;
+  isConnecting: boolean;
+  connection: AgentSocketConnection;
+  subscriptions: Subscription[];
+  errorText: string | null;
 }
 
 @Component({
@@ -27,33 +43,32 @@ interface AgentSession {
 })
 export class AppComponent implements OnInit, OnDestroy {
   readonly AgentStage = AgentStage;
+  readonly maxConcurrentChats = 3;
 
   private readonly fb = inject(FormBuilder);
   private readonly api = inject(ChatApiService);
-  private readonly socket = inject(ChatSocketService);
+  private readonly sockets = inject(ChatSocketService);
 
   readonly agentSession = signal<AgentSession | null>(null);
   readonly queue = signal<QueueEntry[]>([]);
-  readonly activeConversation = signal<ConversationMetadata | null>(null);
-  readonly messages = signal<ChatMessage[]>([]);
-  readonly stage = signal<AgentStage>(AgentStage.Idle);
-  readonly statusText = signal('Select a chat request to begin.');
+  readonly activeChats = signal<AgentChatSession[]>([]);
+  readonly queueActionErrors = signal<Record<string, string>>({});
   readonly queueError = signal<string | null>(null);
   readonly chatError = signal<string | null>(null);
   readonly isConnecting = signal(false);
-  readonly isSending = signal(false);
+
+  readonly statusText = computed(() =>
+    this.activeChats().length
+      ? `Managing ${this.activeChats().length} simultaneous chat${this.activeChats().length > 1 ? 's' : ''}.`
+      : 'Pick a chat request to connect with a customer.'
+  );
 
   readonly loginForm = this.fb.group({
     agentId: ['', [Validators.required, Validators.minLength(3)]],
     displayName: ['', [Validators.required, Validators.minLength(2)]]
   });
 
-  readonly messageForm = this.fb.group({
-    content: ['', [Validators.required, Validators.minLength(1)]]
-  });
-
   private queueSubscription?: Subscription;
-  private socketSubscriptions: Subscription[] = [];
 
   ngOnInit(): void {
     const stored = this.readStoredSession();
@@ -61,13 +76,14 @@ export class AppComponent implements OnInit, OnDestroy {
       this.agentSession.set(stored);
       this.loginForm.patchValue(stored);
       this.startQueuePolling();
+      this.restoreActiveChats(stored);
     }
   }
 
   ngOnDestroy(): void {
     this.stopQueuePolling();
-    this.clearSocketSubscriptions();
-    this.socket.disconnect();
+    this.teardownAllChats();
+    this.sockets.disconnectAll();
   }
 
   signIn(): void {
@@ -85,49 +101,62 @@ export class AppComponent implements OnInit, OnDestroy {
     const session: AgentSession = { agentId, displayName };
     this.agentSession.set(session);
     this.persistSession(session);
-    this.stage.set(AgentStage.Idle);
-    this.statusText.set('Pick a chat request to connect with a customer.');
     this.startQueuePolling();
+    this.restoreActiveChats(session);
   }
 
   signOut(): void {
     this.stopQueuePolling();
-    this.clearSocketSubscriptions();
-    this.socket.disconnect();
+    this.teardownAllChats();
+    this.sockets.disconnectAll();
     this.agentSession.set(null);
     this.queue.set([]);
-    this.activeConversation.set(null);
-    this.messages.set([]);
-    this.stage.set(AgentStage.Idle);
-    this.statusText.set('Signed out.');
+    this.queueActionErrors.set({});
     localStorage.removeItem('agentSession');
   }
 
   joinConversation(entry: QueueEntry): void {
-    const session = this.agentSession();
-    if (!session || this.isConnecting()) {
+    const agent = this.agentSession();
+    if (!agent || this.isConnecting()) {
+      return;
+    }
+
+    if (this.activeChats().length >= this.maxConcurrentChats) {
+      this.chatError.set(`You already have ${this.maxConcurrentChats} active chats.`);
+      return;
+    }
+
+    if (this.activeChats().some((chat) => chat.id === entry.conversationId)) {
+      this.chatError.set('You are already connected to this conversation.');
       return;
     }
 
     this.isConnecting.set(true);
     this.chatError.set(null);
+    this.chatError.set(null);
+    this.setQueueActionError(entry.conversationId, null);
     this.api
       .acceptConversation(entry.conversationId, {
-        agentId: session.agentId,
-        displayName: session.displayName
+        agentId: agent.agentId,
+        displayName: agent.displayName
       })
       .pipe(
         take(1),
         catchError((error) => {
           console.error(error);
-          this.chatError.set(this.resolveErrorMessage(error, 'Unable to join this chat request.'));
+          const message = this.resolveErrorMessage(error, 'Unable to join this chat request.');
+          this.chatError.set(message);
+          this.setQueueActionError(entry.conversationId, message);
           this.isConnecting.set(false);
+          this.refreshQueue();
           return of<ConversationMetadata | null>(null);
         })
       )
       .subscribe((conversation) => {
+        this.isConnecting.set(false);
         if (conversation) {
-          this.openConversation(conversation);
+          this.openConversationSession(conversation, agent);
+          this.setQueueActionError(entry.conversationId, null);
           this.refreshQueue();
         }
       });
@@ -147,69 +176,94 @@ export class AppComponent implements OnInit, OnDestroy {
       .subscribe((entries) => {
         this.queueError.set(null);
         this.queue.set(entries);
+        this.pruneQueueActionErrors(entries);
       });
   }
 
-  sendMessage(): void {
-    if (this.messageForm.invalid) {
-      this.messageForm.markAllAsTouched();
+  sendMessage(conversationId: string): void {
+    const chat = this.findChat(conversationId);
+    if (!chat) {
       return;
     }
 
-    const conversation = this.activeConversation();
-    const content = this.messageForm.controls.content.value?.trim();
-    if (!conversation || !content) {
+    if (chat.messageForm.invalid) {
+      chat.messageForm.markAllAsTouched();
       return;
     }
 
-    this.isSending.set(true);
+    const content = chat.messageForm.controls['content'].value?.trim();
+    if (!content) {
+      return;
+    }
+
+    const connection = chat.connection;
+    const messageForm = chat.messageForm;
+
+    this.updateChatSession(conversationId, (session) => {
+      session.isSending = true;
+      session.errorText = null;
+    });
     this.chatError.set(null);
-    this.socket
-      .sendMessage(conversation.id, content)
+
+    connection
+      .sendMessage(content)
       .then(() => {
-        this.messageForm.reset();
+        messageForm.reset();
       })
-      .catch((error) => {
-        console.error(error);
-        this.chatError.set(error.message ?? 'Unable to send message.');
-      })
-      .finally(() => this.isSending.set(false));
+      .catch((error) => this.setChatError(conversationId, error.message ?? 'Unable to send message.'))
+      .finally(() => {
+        this.updateChatSession(conversationId, (session) => {
+          session.isSending = false;
+        });
+      });
   }
 
-  closeConversation(): void {
-    const conversation = this.activeConversation();
-    const session = this.agentSession();
-    if (!conversation || !session || this.stage() === AgentStage.Ended) {
+  closeConversation(conversationId: string): void {
+    const agent = this.agentSession();
+    const chat = this.findChat(conversationId);
+    if (!agent || !chat || chat.stage === AgentStage.Ended || !chat.conversation) {
       return;
     }
 
-    this.isSending.set(true);
-    this.chatError.set(null);
+    this.updateChatSession(conversationId, (session) => {
+      session.isSending = true;
+      session.errorText = null;
+      session.stage = AgentStage.Ended;
+      session.messageForm.disable({ emitEvent: false });
+    });
 
     this.api
-      .closeConversation(conversation.id, {
-        agentId: session.agentId,
-        displayName: session.displayName
+      .closeConversation(conversationId, {
+        agentId: agent.agentId,
+        displayName: agent.displayName
       })
       .pipe(
         take(1),
         catchError((error) => {
           console.error(error);
-          this.chatError.set(this.resolveErrorMessage(error, 'Unable to close the conversation.'));
+          this.setChatError(conversationId, this.resolveErrorMessage(error, 'Unable to close the conversation.'));
           return of<ConversationMetadata | null>(null);
         })
       )
-      .subscribe((result) => {
-        this.isSending.set(false);
-        if (result) {
-          this.addSystemMessage(conversation.id, 'You closed this chat.');
-          this.stage.set(AgentStage.Ended);
-          this.statusText.set('Conversation closed. Select another request to continue helping customers.');
-          this.socket.disconnect();
-          this.clearSocketSubscriptions();
-          this.refreshQueue();
-        }
+      .subscribe(() => {
+        this.updateChatSession(conversationId, (session) => {
+          session.isSending = false;
+          session.statusText = 'Conversation closed. Waiting for confirmation.';
+        });
+        this.refreshQueue();
       });
+  }
+
+  dismissChat(conversationId: string): void {
+    const chats = [...this.activeChats()];
+    const index = chats.findIndex((chat) => chat.id === conversationId);
+    if (index === -1) {
+      return;
+    }
+    const [removed] = chats.splice(index, 1);
+    removed.subscriptions.forEach((sub) => sub.unsubscribe());
+    removed.connection.disconnect();
+    this.activeChats.set(chats);
   }
 
   trackQueue(_index: number, entry: QueueEntry): string {
@@ -218,6 +272,10 @@ export class AppComponent implements OnInit, OnDestroy {
 
   trackMessage(_index: number, message: ChatMessage): string {
     return message.id;
+  }
+
+  trackChat(_index: number, chat: AgentChatSession): string {
+    return chat.id;
   }
 
   messageClasses(message: ChatMessage): Record<string, boolean> {
@@ -230,104 +288,116 @@ export class AppComponent implements OnInit, OnDestroy {
     };
   }
 
-  formatTime(value?: string): string {
-    if (!value) {
-      return '--:--';
-    }
-    return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
-
-  private openConversation(conversation: ConversationMetadata): void {
-    const session = this.agentSession();
-    if (!session) {
-      return;
-    }
-
-    this.activeConversation.set(conversation);
-    this.messages.set([]);
-    this.chatError.set(null);
-    this.statusText.set('Connecting to the customer...');
-    this.isConnecting.set(true);
-
-    this.clearSocketSubscriptions();
-    this.socket.disconnect();
-
-    const handshake$ = this.socket.connectAgent({
-      agentId: session.agentId,
-      displayName: session.displayName,
+  private openConversationSession(conversation: ConversationMetadata, agent: AgentSession): void {
+    const connection = this.sockets.createConnection({
+      agentId: agent.agentId,
+      displayName: agent.displayName,
       conversationId: conversation.id
     });
 
-    this.socketSubscriptions.push(
-      handshake$.pipe(take(1)).subscribe({
-        next: (handshake) => {
-          this.stage.set(AgentStage.Active);
-          this.activeConversation.set(handshake.conversation);
-          this.statusText.set('You are now connected. Say hello!');
-          this.isConnecting.set(false);
-          this.loadHistory(handshake.conversation.id, session.agentId);
-        },
-        error: (error) => {
-          console.error(error);
-          this.chatError.set(error.message ?? 'Failed to connect to the chat service.');
-          this.statusText.set('Connection failed. Try selecting the request again.');
-          this.isConnecting.set(false);
-          this.stage.set(AgentStage.Idle);
-          this.socket.disconnect();
-        }
-      })
-    );
+    const messageForm = this.fb.group({
+      content: ['', [Validators.required, Validators.minLength(1)]]
+    });
+    messageForm.disable({ emitEvent: false });
 
-    this.attachSocketListeners();
+    const chatSession: AgentChatSession = {
+      id: conversation.id,
+      conversation,
+      stage: AgentStage.Connecting,
+      statusText: 'Connecting to the customer...',
+      messages: [],
+      messageForm,
+      isSending: false,
+      isConnecting: true,
+      connection,
+      subscriptions: [],
+      errorText: null
+    };
+
+    this.activeChats.update((chats) => [...chats, chatSession]);
+
+    const handshakeSub = connection.handshake$.pipe(take(1)).subscribe({
+      next: (handshake) => {
+        this.updateChatSession(conversation.id, (session) => {
+          session.conversation = handshake.conversation;
+          session.stage = AgentStage.Active;
+          session.statusText = `You are now connected with ${
+            handshake.conversation.customer?.displayName ||
+            handshake.conversation.customer?.id ||
+            'the customer'
+          }.`;
+          session.isConnecting = false;
+          session.messageForm.enable({ emitEvent: false });
+        });
+        this.chatError.set(null);
+        this.loadHistory(conversation.id, agent.agentId);
+      },
+      error: (error) => this.setChatError(conversation.id, error.message ?? 'Unable to connect to chat service.')
+    });
+    chatSession.subscriptions.push(handshakeSub);
+
+    const messageSub = connection.messages$.subscribe((message) => this.handleIncomingMessage(conversation.id, message));
+    chatSession.subscriptions.push(messageSub);
+
+    const errorSub = connection.errors$.subscribe((error) => this.setChatError(conversation.id, error));
+    chatSession.subscriptions.push(errorSub);
+
+    const disconnectSub = connection.disconnect$.subscribe(() => this.onChatDisconnected(conversation.id));
+    chatSession.subscriptions.push(disconnectSub);
   }
 
   private loadHistory(conversationId: string, agentId: string): void {
-    this.socketSubscriptions.push(
-      this.api
-        .listConversationMessages(conversationId, agentId)
-        .pipe(
-          take(1),
-          catchError((error) => {
-            console.error(error);
-            this.chatError.set(this.resolveErrorMessage(error, 'Unable to load previous messages.'));
-            return of<ChatMessage[]>([]);
-          })
-        )
-        .subscribe((history) => {
-          if (history.length) {
-            this.messages.update((current) => this.mergeMessages(current, history));
-          }
+    this.api
+      .listConversationMessages(conversationId, agentId)
+      .pipe(
+        take(1),
+        catchError((error) => {
+          console.error(error);
+          this.setChatError(conversationId, this.resolveErrorMessage(error, 'Unable to load previous messages.'));
+          return of<ChatMessage[]>([]);
         })
-    );
+      )
+      .subscribe((history) => {
+        if (!history.length) {
+          return;
+        }
+        this.updateChatSession(conversationId, (session) => {
+          session.messages = this.mergeMessages(session.messages, history);
+          session.stage = AgentStage.Active;
+          session.isConnecting = false;
+        });
+      });
   }
 
-  private attachSocketListeners(): void {
-    this.socketSubscriptions.push(
-      this.socket.onMessage().subscribe((message) => {
-        this.messages.update((current) => this.mergeMessages(current, [message]));
-        if (message.sender?.type === 'CUSTOMER') {
-          this.statusText.set(`${message.sender.displayName || 'Customer'} is waiting for your reply.`);
-        }
-        if (message.type?.toUpperCase() === 'SYSTEM') {
-          this.stage.set(AgentStage.Ended);
-          this.statusText.set(message.content || 'The chat was closed.');
-          this.socket.disconnect();
-          this.clearSocketSubscriptions();
-        }
-      })
-    );
+  private handleIncomingMessage(conversationId: string, message: ChatMessage): void {
+    this.updateChatSession(conversationId, (session) => {
+      session.messages = this.mergeMessages(session.messages, [message]);
 
-    this.socketSubscriptions.push(
-      this.socket.onDisconnect().subscribe(() => {
-        if (this.stage() === AgentStage.Active) {
-          this.chatError.set('Connection lost. Reopen the conversation if you need to continue.');
-        }
-      })
-    );
+      const senderType = message.sender?.type?.toUpperCase();
+      if (senderType === 'CUSTOMER') {
+        session.statusText = `${message.sender?.displayName || 'Customer'} is waiting for your reply.`;
+      }
 
-    this.socketSubscriptions.push(
-      this.socket.onError().subscribe((error) => this.chatError.set(error))
-    );
+      if (message.type?.toUpperCase() === 'SYSTEM') {
+        session.messageForm.disable({ emitEvent: false });
+        session.connection.disconnect();
+        session.stage = AgentStage.Ended;
+        session.statusText = message.content || 'The chat was closed.';
+        session.isSending = false;
+      }
+    });
+  }
+
+  private onChatDisconnected(conversationId: string): void {
+    this.updateChatSession(conversationId, (session) => {
+      if (session.stage === AgentStage.Ended) {
+        return;
+      }
+      session.messageForm.disable({ emitEvent: false });
+      session.errorText = 'Connection lost. Reopen the conversation if you need to continue.';
+      session.stage = AgentStage.Ended;
+      session.isSending = false;
+    });
   }
 
   private mergeMessages(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
@@ -336,20 +406,65 @@ export class AppComponent implements OnInit, OnDestroy {
     return Array.from(byId.values()).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
   }
 
-  private addSystemMessage(conversationId: string, content: string): void {
-    const message: ChatMessage = {
-      id: `local-${Date.now()}`,
-      conversationId,
-      type: 'SYSTEM',
-      content,
-      timestamp: new Date().toISOString(),
-      sender: {
-        id: 'agent',
-        type: 'SYSTEM',
-        displayName: 'System'
+  private findChat(conversationId: string): AgentChatSession | undefined {
+    return this.activeChats().find((chat) => chat.id === conversationId);
+  }
+
+  private setChatError(conversationId: string, error: string): void {
+    this.chatError.set(error);
+    this.updateChatSession(conversationId, (session) => {
+      session.errorText = error;
+      session.isSending = false;
+    });
+  }
+
+  private teardownAllChats(): void {
+    const chats = this.activeChats();
+    chats.forEach((chat) => {
+      chat.subscriptions.forEach((sub) => sub.unsubscribe());
+      chat.connection.disconnect();
+    });
+    this.activeChats.set([]);
+  }
+
+  private updateChatSession(conversationId: string, updater: (chat: AgentChatSession) => void): void {
+    this.activeChats.update((chats) => {
+      let changed = false;
+      const next = chats.map((chat) => {
+        if (chat.id !== conversationId) {
+          return chat;
+        }
+        updater(chat);
+        changed = true;
+        return chat;
+      });
+      return changed ? [...next] : chats;
+    });
+  }
+
+  private setQueueActionError(conversationId: string, message: string | null): void {
+    this.queueActionErrors.update((current) => {
+      const next = { ...current };
+      if (!message) {
+        delete next[conversationId];
+      } else {
+        next[conversationId] = message;
       }
-    };
-    this.messages.update((current) => [...current, message]);
+      return next;
+    });
+  }
+
+  private pruneQueueActionErrors(entries: QueueEntry[]): void {
+    const ids = new Set(entries.map((entry) => entry.conversationId));
+    this.queueActionErrors.update((current) => {
+      const next = { ...current };
+      Object.keys(next).forEach((conversationId) => {
+        if (!ids.has(conversationId)) {
+          delete next[conversationId];
+        }
+      });
+      return next;
+    });
   }
 
   private startQueuePolling(): void {
@@ -372,6 +487,7 @@ export class AppComponent implements OnInit, OnDestroy {
       .subscribe((entries) => {
         this.queueError.set(null);
         this.queue.set(entries);
+        this.pruneQueueActionErrors(entries);
       });
   }
 
@@ -380,10 +496,32 @@ export class AppComponent implements OnInit, OnDestroy {
     this.queueSubscription = undefined;
   }
 
-  private clearSocketSubscriptions(): void {
-    while (this.socketSubscriptions.length) {
-      this.socketSubscriptions.pop()?.unsubscribe();
-    }
+  private restoreActiveChats(agent: AgentSession): void {
+    this.api
+      .listAgentConversations(agent.agentId, ['ASSIGNED'])
+      .pipe(
+        take(1),
+        catchError((error) => {
+          console.error(error);
+          this.chatError.set(this.resolveErrorMessage(error, 'Unable to load assigned conversations.'));
+          return of<ConversationMetadata[]>([]);
+        })
+      )
+      .subscribe((conversations) => {
+        const availableSlots = this.maxConcurrentChats - this.activeChats().length;
+        if (availableSlots <= 0) {
+          return;
+        }
+
+        conversations
+          .filter((conversation) => !this.activeChats().some((chat) => chat.id === conversation.id))
+          .slice(0, availableSlots)
+          .forEach((conversation) => this.openConversationSession(conversation, agent));
+
+        if (conversations.length) {
+          this.chatError.set(null);
+        }
+      });
   }
 
   private readStoredSession(): AgentSession | null {
@@ -407,6 +545,13 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   private resolveErrorMessage(error: unknown, fallback: string): string {
+    if (error instanceof HttpErrorResponse) {
+      const message = this.resolveHttpError(error);
+      if (message) {
+        return message;
+      }
+    }
+
     if (error && typeof error === 'object') {
       if ('error' in error) {
         const payload = (error as any).error;
@@ -422,6 +567,39 @@ export class AppComponent implements OnInit, OnDestroy {
       }
     }
     return fallback;
+  }
+
+  private resolveHttpError(error: HttpErrorResponse): string | null {
+    if (error.status === 0) {
+      return 'Unable to reach the chat service. Check your connection and try again.';
+    }
+
+    switch (error.status) {
+      case 401:
+      case 403:
+        return 'You are not allowed to perform this action. Please sign in again.';
+      case 404:
+        return 'This conversation is no longer available.';
+      case 409:
+        return 'Another agent accepted this conversation moments ago.';
+      case 422:
+        return 'The request could not be processed. Please verify the details and try again.';
+    }
+
+    const payload = error.error;
+    if (typeof payload === 'string' && payload.trim()) {
+      return payload;
+    }
+    if (payload && typeof payload === 'object') {
+      if ('message' in payload && typeof payload.message === 'string') {
+        return payload.message;
+      }
+      if ('error' in payload && typeof payload.error === 'string') {
+        return payload.error;
+      }
+    }
+
+    return error.message || null;
   }
 }
 

@@ -10,6 +10,10 @@ import com.example.chat.domain.ConversationMetadata;
 import com.example.chat.domain.ConversationStatus;
 import com.example.chat.dto.ChatMessagePayload;
 import com.example.chat.dto.SocketHandshakeResponse;
+import com.example.chat.event.ChatEvent;
+import com.example.chat.event.ChatEventListener;
+import com.example.chat.event.ChatEventType;
+import com.example.chat.event.ChatMessageEvent;
 import com.example.chat.service.ConversationService;
 import com.example.chat.service.ParticipantIdentityService;
 import com.example.chat.service.PresenceService;
@@ -20,22 +24,24 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationContext;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class SocketIoChatGateway {
+public class SocketIoChatGateway implements ChatEventListener {
 
     private static final String MESSAGE_EVENT = "chat:message";
     private static final String SYSTEM_EVENT = "system:event";
     private static final String ERROR_EVENT = "system:error";
 
     private final SocketIOServer socketIOServer;
-    private final ConversationService conversationService;
+    // private final ConversationService conversationService;
     private final PresenceService presenceService;
     private final ParticipantIdentityService participantIdentityService;
+    private final ApplicationContext applicationContext;
 
     private final Map<UUID, ChatParticipant> participantsByClient = new ConcurrentHashMap<>();
     private final Map<UUID, String> conversationByClient = new ConcurrentHashMap<>();
@@ -86,7 +92,7 @@ public class SocketIoChatGateway {
     private ConversationMetadata resolveConversation(
             SocketIOClient client, ChatParticipant participant, String conversationId, boolean isAgent) {
         if (StringUtils.hasText(conversationId)) {
-            return conversationService
+            return applicationContext.getBean(ConversationService.class)
                     .getConversation(conversationId)
                     .map(conversation -> {
                         if (conversation.getStatus() == ConversationStatus.CLOSED) {
@@ -101,7 +107,7 @@ public class SocketIoChatGateway {
             throw new IllegalArgumentException("Agents must join with a conversationId");
         }
 
-        ConversationMetadata conversation = conversationService.startConversation(participant, Map.of());
+        ConversationMetadata conversation = applicationContext.getBean(ConversationService.class).startConversation(participant, Map.of());
         client.set("conversationId", conversation.getId());
         return conversation;
     }
@@ -126,9 +132,8 @@ public class SocketIoChatGateway {
         try {
             ChatMessageType messageType = ChatMessageType.valueOf(payload.getType().toUpperCase(Locale.ROOT));
             ChatMessage message =
-                    conversationService.sendMessage(payload.getConversationId(), sender, payload.getContent(), messageType);
+                    applicationContext.getBean(ConversationService.class).sendMessage(payload.getConversationId(), sender, payload.getContent(), messageType);
 
-            socketIOServer.getRoomOperations(payload.getConversationId()).sendEvent(MESSAGE_EVENT, message);
             if (ackSender != null) {
                 ackSender.sendAckData(message);
             }
@@ -138,6 +143,21 @@ public class SocketIoChatGateway {
                 ackSender.sendAckData(Map.of("error", ex.getMessage()));
             }
         }
+    }
+
+    @Override
+    public void onLifecycleEvent(ChatEvent event) {
+        // Lifecycle events can be forwarded here in the future if needed.
+        if (event.getType() == ChatEventType.CONVERSATION_CLOSED) {
+            log.debug("Conversation {} closed", event.getConversationId());
+        }
+    }
+
+    @Override
+    public void onMessageEvent(ChatMessageEvent event) {
+        socketIOServer
+                .getRoomOperations(event.getConversationId())
+                .sendEvent(MESSAGE_EVENT, event.getMessage());
     }
 }
 

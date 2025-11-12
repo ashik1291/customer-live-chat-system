@@ -28,6 +28,14 @@ public class RestExceptionHandler {
                         "error", ex.getMessage()));
     }
 
+    @ExceptionHandler(IllegalStateException.class)
+    public ResponseEntity<?> handleIllegalState(IllegalStateException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(Map.of(
+                        "timestamp", Instant.now().toString(),
+                        "error", ex.getMessage()));
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<?> handleGeneric(Exception ex) {
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)

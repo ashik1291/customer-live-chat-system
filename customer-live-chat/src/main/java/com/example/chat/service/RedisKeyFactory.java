@@ -24,6 +24,10 @@ public class RedisKeyFactory {
         return "%s:conversation:%s:messages".formatted(prefix(), conversationId);
     }
 
+    public String conversationAssignmentKey(String conversationId) {
+        return "%s:conversation:%s:agent".formatted(prefix(), conversationId);
+    }
+
     public String conversationPattern() {
         return "%s:conversation:*".formatted(prefix());
     }

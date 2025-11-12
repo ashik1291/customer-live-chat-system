@@ -10,35 +10,47 @@
 
   <section *ngIf="isWidgetOpen()" class="chat-widget">
     <header class="chat-widget__header">
-      <div>
-        <h2>Live Support</h2>
-        <p>{{ statusText() }}</p>
+      <div class="chat-widget__heading">
+        <span class="chat-widget__badge">Support</span>
+        <h2>Customer Care</h2>
       </div>
-      <button type="button" class="close-button" (click)="closeWidget()">Close</button>
+      <button type="button" class="close-button" (click)="closeWidget()" aria-label="Close chat widget">
+        &times;
+      </button>
     </header>
 
-    <div class="chat-widget__body">
+    <div class="chat-widget__status">
+      <p>{{ statusText() }}</p>
+    </div>
+
+    <div class="chat-widget__body" [class.chat-widget__body--ended]="stage() === ChatStage.Ended">
       <div class="alert alert-error" *ngIf="errorText() as error">
         {{ error }}
       </div>
 
-      <ng-container [ngSwitch]="stage()">
-        <div *ngSwitchCase="ChatStage.Confirm" class="chat-prompt">
-          <h3>Start a conversation?</h3>
-          <p>Connect with our support team in just a few seconds.</p>
-          <div class="chat-prompt__actions">
-            <button type="button" class="btn btn-secondary" (click)="closeWidget()">Not now</button>
-            <button type="button" class="btn btn-primary" (click)="startConversation()">Start chat</button>
-          </div>
+      <ng-template #welcomeTemplate>
+        <div class="chat-greeting">
+          <h3>Hi there! How can we help you today?</h3>
+          <p>Start a real-time conversation with our support team in seconds.</p>
+          <button type="button" class="btn btn-primary" (click)="startConversation()">Start Chat</button>
         </div>
+      </ng-template>
+
+      <ng-container [ngSwitch]="stage()">
+        <ng-container *ngSwitchCase="ChatStage.Idle" [ngTemplateOutlet]="welcomeTemplate"></ng-container>
+
+        <ng-container *ngSwitchCase="ChatStage.Confirm" [ngTemplateOutlet]="welcomeTemplate"></ng-container>
 
         <div *ngSwitchCase="ChatStage.Connecting" class="chat-loader">
           <span class="spinner" aria-hidden="true"></span>
           <p>Setting things up...</p>
         </div>
 
-        <div *ngSwitchCase="ChatStage.Waiting" class="chat-session">
-          <div class="message-list" [class.message-list--empty]="!messages().length">
+        <div
+          *ngSwitchCase="ChatStage.Waiting"
+          class="chat-session chat-session--waiting"
+        >
+          <div class="chat-history" [class.chat-history--empty]="!messages().length">
             <article
               *ngFor="let message of messages(); trackBy: trackByMessageId"
               [ngClass]="messageClasses(message)"
@@ -52,17 +64,17 @@
           </div>
           <p class="queue-hint">
             <ng-container *ngIf="queueStatus() as queue">
-              Position in line: <strong>{{ (queue.position ?? 0) + 1 }}</strong>
+              You're in line. Position <strong>{{ (queue.position ?? 0) + 1 }}</strong>
               <ng-container *ngIf="formatEstimate(queue.estimatedWait) as wait">
-                - Estimated wait {{ wait }}
+                • Estimated wait {{ wait }}
               </ng-container>
             </ng-container>
-            <ng-container *ngIf="!queueStatus()">We'll notify you here as soon as someone joins.</ng-container>
+            <ng-container *ngIf="!queueStatus()">Hang tight—we'll pair you with the next available specialist.</ng-container>
           </p>
         </div>
 
         <div *ngSwitchCase="ChatStage.Active" class="chat-session">
-          <div class="message-list" [class.message-list--empty]="!messages().length">
+          <div class="chat-history">
             <article
               *ngFor="let message of messages(); trackBy: trackByMessageId"
               [ngClass]="messageClasses(message)"
@@ -76,7 +88,14 @@
           </div>
 
           <form class="composer" [formGroup]="messageForm" (ngSubmit)="sendMessage()">
-            <textarea formControlName="content" placeholder="Type your message..." rows="3" [disabled]="!canSendMessages()"></textarea>
+            <label class="sr-only" for="chat-message">Type your message</label>
+            <textarea
+              id="chat-message"
+              formControlName="content"
+              placeholder="Type your message…"
+              rows="3"
+              [disabled]="!canSendMessages()"
+            ></textarea>
             <div class="composer__actions">
               <button type="submit" class="btn btn-primary" [disabled]="messageForm.invalid || !canSendMessages() || isSending()">
                 {{ isSending() ? 'Sending...' : 'Send' }}
@@ -86,7 +105,7 @@
         </div>
 
         <div *ngSwitchCase="ChatStage.Ended" class="chat-session chat-session--ended">
-          <div class="message-list" [class.message-list--empty]="!messages().length">
+          <div class="chat-history chat-history--inactive">
             <article
               *ngFor="let message of messages(); trackBy: trackByMessageId"
               [ngClass]="messageClasses(message)"
@@ -99,10 +118,12 @@
             </article>
           </div>
           <div class="chat-session__footer">
-            <p>Thanks for chatting with us! We're here when you need us again.</p>
-            <button type="button" class="btn btn-primary" (click)="restartChat()">Start a new chat</button>
+            <p>The conversation has ended. Start a new chat anytime.</p>
+            <button type="button" class="btn btn-primary" (click)="restartChat()">Start New Chat</button>
           </div>
         </div>
+
+        <ng-container *ngSwitchDefault [ngTemplateOutlet]="welcomeTemplate"></ng-container>
       </ng-container>
     </div>
   </section>

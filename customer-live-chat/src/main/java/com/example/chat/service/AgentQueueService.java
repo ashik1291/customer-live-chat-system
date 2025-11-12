@@ -10,10 +10,53 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
 @Service
 public class AgentQueueService {
+
+    private static final DefaultRedisScript<List> CLAIM_FOR_AGENT_SCRIPT;
+
+    static {
+        CLAIM_FOR_AGENT_SCRIPT = new DefaultRedisScript<>();
+        CLAIM_FOR_AGENT_SCRIPT.setResultType(List.class);
+        CLAIM_FOR_AGENT_SCRIPT.setScriptText(
+                """
+                local queueKey = KEYS[1]
+                local assignmentKey = KEYS[2]
+                local conversationId = ARGV[1]
+                local agentId = ARGV[2]
+                local ttl = tonumber(ARGV[3])
+
+                local owner = redis.call('GET', assignmentKey)
+                if owner and owner ~= agentId then
+                    return {'BUSY'}
+                end
+
+                local entries = redis.call('ZRANGE', queueKey, 0, -1)
+                for _, raw in ipairs(entries) do
+                    local ok, decoded = pcall(cjson.decode, raw)
+                    if ok and decoded ~= nil and decoded['conversationId'] == conversationId then
+                        redis.call('ZREM', queueKey, raw)
+                        redis.call('SET', assignmentKey, agentId)
+                        if ttl and ttl > 0 then
+                            redis.call('PEXPIRE', assignmentKey, ttl)
+                        end
+                        return {'CLAIMED', raw}
+                    end
+                end
+
+                if owner == agentId then
+                    if ttl and ttl > 0 then
+                        redis.call('PEXPIRE', assignmentKey, ttl)
+                    end
+                    return {'OWNED'}
+                end
+
+                return {'MISSING'}
+                """);
+    }
 
     private final StringRedisTemplate redisTemplate;
     private final RedisKeyFactory keyFactory;
@@ -34,6 +77,27 @@ public class AgentQueueService {
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Unable to serialize queue entry", e);
         }
+    }
+
+    public ClaimResult claimForAgent(String conversationId, String agentId, Duration assignmentTtl) {
+        long ttlMillis = assignmentTtl != null && !assignmentTtl.isNegative() ? assignmentTtl.toMillis() : 0L;
+        @SuppressWarnings("unchecked")
+        List<String> response = (List<String>) redisTemplate.execute(
+                CLAIM_FOR_AGENT_SCRIPT,
+                List.of(keyFactory.queueKey(), keyFactory.conversationAssignmentKey(conversationId)),
+                conversationId,
+                agentId,
+                String.valueOf(ttlMillis));
+
+        if (response == null || response.isEmpty()) {
+            return new ClaimResult(ClaimStatus.MISSING, Optional.empty());
+        }
+
+        String status = response.get(0);
+        Optional<QueueEntry> entry =
+                response.size() > 1 ? deserialize(response.get(1)) : Optional.empty();
+
+        return new ClaimResult(ClaimStatus.valueOf(status), entry);
     }
 
     public Optional<QueueEntry> peek() {
@@ -139,5 +203,14 @@ public class AgentQueueService {
             return Optional.empty();
         }
     }
+
+    public enum ClaimStatus {
+        CLAIMED,
+        OWNED,
+        MISSING,
+        BUSY
+    }
+
+    public record ClaimResult(ClaimStatus status, Optional<QueueEntry> entry) {}
 }
 

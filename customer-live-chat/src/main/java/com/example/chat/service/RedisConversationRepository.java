@@ -82,6 +82,7 @@ public class RedisConversationRepository implements ConversationRepository {
         }
         return keys.stream()
                 .filter(key -> !key.endsWith(":messages"))
+                .filter(key -> !key.endsWith(":agent"))
                 .map(redisTemplate.opsForValue()::get)
                 .map(this::readConversation)
                 .flatMap(Optional::stream)

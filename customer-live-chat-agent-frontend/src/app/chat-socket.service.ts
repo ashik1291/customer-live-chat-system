@@ -14,107 +14,143 @@ export interface AgentSocketOptions {
   conversationId: string;
 }
 
+export interface AgentSocketConnection {
+  conversationId: string;
+  handshake$: Observable<SocketHandshake>;
+  messages$: Observable<ChatMessage>;
+  disconnect$: Observable<void>;
+  errors$: Observable<string>;
+  sendMessage(content: string, type?: string): Promise<ChatMessage>;
+  disconnect(): void;
+}
+
+interface AgentSocketContext {
+  socket: Socket;
+  handshake$: ReplaySubject<SocketHandshake>;
+  messages$: Subject<ChatMessage>;
+  disconnect$: Subject<void>;
+  error$: Subject<string>;
+}
+
 @Injectable({ providedIn: 'root' })
 export class ChatSocketService {
-  private socket?: Socket;
-  private handshake$ = new ReplaySubject<SocketHandshake>(1);
-  private messages$ = new Subject<ChatMessage>();
-  private disconnect$ = new Subject<void>();
-  private error$ = new Subject<string>();
+  private readonly connections = new Map<string, AgentSocketContext>();
 
   constructor(private readonly zone: NgZone) {}
 
-  connectAgent(options: AgentSocketOptions): Observable<SocketHandshake> {
-    this.disconnect();
+  createConnection(options: AgentSocketOptions): AgentSocketConnection {
+    const conversationId = options.conversationId;
 
-    this.handshake$ = new ReplaySubject<SocketHandshake>(1);
-    this.messages$ = new Subject<ChatMessage>();
-    this.disconnect$ = new Subject<void>();
-    this.error$ = new Subject<string>();
+    if (this.connections.has(conversationId)) {
+      return this.buildConnection(conversationId, this.connections.get(conversationId)!);
+    }
 
-    this.socket = io(SOCKET_BASE.replace(/\/$/, ''), {
+    const socket = io(SOCKET_BASE.replace(/\/$/, ''), {
       transports: ['websocket'],
       query: {
         role: 'agent',
         token: options.agentId,
         displayName: options.displayName,
-        conversationId: options.conversationId
+        conversationId
       }
     });
 
-    this.registerListeners();
-    return this.handshake$.asObservable();
+    const context: AgentSocketContext = {
+      socket,
+      handshake$: new ReplaySubject<SocketHandshake>(1),
+      messages$: new Subject<ChatMessage>(),
+      disconnect$: new Subject<void>(),
+      error$: new Subject<string>()
+    };
+
+    this.connections.set(conversationId, context);
+    this.registerListeners(conversationId, context);
+
+    return this.buildConnection(conversationId, context);
   }
 
-  onMessage(): Observable<ChatMessage> {
-    return this.messages$.asObservable();
+  disconnect(conversationId: string): void {
+    this.destroyConnection(conversationId, true);
   }
 
-  onDisconnect(): Observable<void> {
-    return this.disconnect$.asObservable();
+  disconnectAll(): void {
+    Array.from(this.connections.keys()).forEach((conversationId) => this.destroyConnection(conversationId, true));
   }
 
-  onError(): Observable<string> {
-    return this.error$.asObservable();
-  }
-
-  sendMessage(conversationId: string, content: string, type: string = 'TEXT'): Promise<ChatMessage> {
-    return new Promise((resolve, reject) => {
-      if (!this.socket) {
-        reject(new Error('Socket not connected'));
-        return;
-      }
-
-      this.socket.emit(
-        MESSAGE_EVENT,
-        { conversationId, content, type },
-        (response: ChatMessage | { error?: string }) => {
-          if (response && typeof response === 'object' && 'error' in response) {
-            reject(new Error(response.error ?? 'Unable to send message'));
-          } else {
-            resolve(response as ChatMessage);
+  private buildConnection(conversationId: string, context: AgentSocketContext): AgentSocketConnection {
+    return {
+      conversationId,
+      handshake$: context.handshake$.asObservable(),
+      messages$: context.messages$.asObservable(),
+      disconnect$: context.disconnect$.asObservable(),
+      errors$: context.error$.asObservable(),
+      sendMessage: (content: string, type: string = 'TEXT') =>
+        new Promise<ChatMessage>((resolve, reject) => {
+          const socketContext = this.connections.get(conversationId);
+          if (!socketContext) {
+            reject(new Error('Socket not connected'));
+            return;
           }
-        }
-      );
+
+          socketContext.socket.emit(MESSAGE_EVENT, { conversationId, content, type }, (response: ChatMessage | { error?: string }) =>
+            this.zone.run(() => {
+              if (response && typeof response === 'object' && 'error' in response) {
+                reject(new Error(response.error ?? 'Unable to send message'));
+              } else {
+                resolve(response as ChatMessage);
+              }
+            })
+          );
+        }),
+      disconnect: () => this.disconnect(conversationId)
+    };
+  }
+
+  private registerListeners(conversationId: string, context: AgentSocketContext): void {
+    const { socket, handshake$, messages$, error$, disconnect$ } = context;
+
+    socket.on('connect_error', (error: Error) => {
+      this.zone.run(() => {
+        handshake$.error(error);
+        error$.next(error.message ?? 'Unable to connect to chat service.');
+      });
+    });
+
+    socket.on(SYSTEM_EVENT, (payload: SocketHandshake) => {
+      this.zone.run(() => handshake$.next(payload));
+    });
+
+    socket.on(MESSAGE_EVENT, (payload: ChatMessage) => {
+      this.zone.run(() => messages$.next(payload));
+    });
+
+    socket.on('system:error', (payload: { message?: string }) => {
+      this.zone.run(() => error$.next(payload?.message ?? 'Chat service error'));
+    });
+
+    socket.on('disconnect', () => {
+      this.zone.run(() => {
+        disconnect$.next();
+        this.destroyConnection(conversationId, false);
+      });
     });
   }
 
-  disconnect(): void {
-    if (this.socket) {
-      this.socket.disconnect();
-      this.socket = undefined;
-    }
-  }
-
-  private registerListeners(): void {
-    if (!this.socket) {
+  private destroyConnection(conversationId: string, closeSocket: boolean): void {
+    const context = this.connections.get(conversationId);
+    if (!context) {
       return;
     }
 
-    this.socket.on('connect_error', (error: Error) => {
-      this.zone.run(() => {
-        this.handshake$.error(error);
-        this.error$.next(error.message ?? 'Unable to connect to chat service.');
-      });
-    });
-
-    this.socket.on(SYSTEM_EVENT, (payload: SocketHandshake) => {
-      this.zone.run(() => {
-        this.handshake$.next(payload);
-      });
-    });
-
-    this.socket.on(MESSAGE_EVENT, (payload: ChatMessage) => {
-      this.zone.run(() => this.messages$.next(payload));
-    });
-
-    this.socket.on('system:error', (payload: { message?: string }) => {
-      this.zone.run(() => this.error$.next(payload?.message ?? 'Chat service error'));
-    });
-
-    this.socket.on('disconnect', () => {
-      this.zone.run(() => this.disconnect$.next());
-    });
+    context.socket.removeAllListeners();
+    if (closeSocket) {
+      context.socket.disconnect();
+    }
+    context.handshake$.complete();
+    context.messages$.complete();
+    context.disconnect$.complete();
+    context.error$.complete();
+    this.connections.delete(conversationId);
   }
 }
 
