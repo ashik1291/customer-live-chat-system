@@ -68,6 +68,11 @@ public class ConversationService {
         Instant now = Instant.now();
         conversation.setStatus(ConversationStatus.QUEUED);
         conversation.setUpdatedAt(now);
+        ChatParticipant previousAgent = conversation.getAgent();
+        if (previousAgent != null) {
+            agentAssignmentService.removeAssignment(previousAgent.getId(), conversation.getId());
+            conversation.setAgent(null);
+        }
         conversationRepository.saveConversation(conversation);
         releaseAssignment(conversation.getId());
         queueService.enqueue(QueueEntry.builder()

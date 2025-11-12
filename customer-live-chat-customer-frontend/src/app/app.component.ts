@@ -1,5 +1,18 @@
 import { CommonModule } from '@angular/common';
-import { ChangeDetectionStrategy, Component, OnDestroy, OnInit, computed, inject, signal } from '@angular/core';
+import { HttpErrorResponse } from '@angular/common/http';
+import {
+  AfterViewInit,
+  ChangeDetectionStrategy,
+  Component,
+  ElementRef,
+  OnDestroy,
+  OnInit,
+  QueryList,
+  ViewChildren,
+  computed,
+  inject,
+  signal
+} from '@angular/core';
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { Subscription, catchError, finalize, of, switchMap, take } from 'rxjs';
 import { ChatApiService } from './chat-api.service';
@@ -39,7 +52,7 @@ interface StoredConversationState {
   styleUrl: './app.component.scss',
   changeDetection: ChangeDetectionStrategy.OnPush
 })
-export class AppComponent implements OnInit, OnDestroy {
+export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
   readonly ChatStage = ChatStage;
 
   private readonly fb = inject(FormBuilder);
@@ -58,6 +71,8 @@ export class AppComponent implements OnInit, OnDestroy {
   readonly participantId = signal<string | null>(null);
   readonly isSending = signal(false);
 
+  @ViewChildren('historyContainer') private historyContainers?: QueryList<ElementRef<HTMLDivElement>>;
+
   readonly canSendMessages = computed(() => this.stage() === ChatStage.Active);
 
   readonly messageForm = this.fb.group({
@@ -75,6 +90,11 @@ export class AppComponent implements OnInit, OnDestroy {
     this.setComposerEnabled(false);
     this.openWidget();
     this.restoreActiveConversation();
+  }
+
+  ngAfterViewInit(): void {
+    this.scrollHistoryToBottom();
+    this.historyContainers?.changes.subscribe(() => this.scrollHistoryToBottom());
   }
 
   ngOnDestroy(): void {
@@ -124,6 +144,7 @@ export class AppComponent implements OnInit, OnDestroy {
               'Please wait, our support agent will join you shortly.'
             )
           ]);
+          this.scrollHistoryToBottom();
           this.statusText.set('We are finding the best available agent for you.');
           this.stage.set(ChatStage.Waiting);
           this.setComposerEnabled(false);
@@ -134,9 +155,20 @@ export class AppComponent implements OnInit, OnDestroy {
               catchError((error) => {
                 console.error(error);
                 this.errorText.set(this.resolveErrorMessage(error, 'Unable to place you in the queue.'));
+                this.stage.set(ChatStage.Confirm);
+                this.statusText.set(this.greetingText);
+                this.setComposerEnabled(false);
                 return of<QueueStatusResponse | null>(null);
               })
             );
+        }),
+        catchError((error) => {
+          console.error(error);
+          this.errorText.set(this.resolveErrorMessage(error, 'Unable to start a conversation right now.'));
+          this.stage.set(ChatStage.Confirm);
+          this.statusText.set(this.greetingText);
+          this.setComposerEnabled(false);
+          return of<QueueStatusResponse | null>(null);
         }),
         finalize(() => {
           if (this.stage() === ChatStage.Connecting) {
@@ -183,6 +215,15 @@ export class AppComponent implements OnInit, OnDestroy {
       .finally(() => {
         this.isSending.set(false);
       });
+  }
+
+  onComposerKeydown(event: KeyboardEvent): void {
+    if (event.isComposing || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) {
+      return;
+    }
+
+    event.preventDefault();
+    this.sendMessage();
   }
 
   restartChat(): void {
@@ -305,19 +346,31 @@ export class AppComponent implements OnInit, OnDestroy {
     }
 
     this.messages.update((current) => this.mergeMessages(current, [normalized]));
+    this.scrollHistoryToBottom('smooth');
   }
 
   private loadHistory(conversationId: string): void {
     this.activeSubscriptions.push(
       this.api
         .listMessages(conversationId)
-        .pipe(take(1))
+        .pipe(
+          take(1),
+          catchError((error) => {
+            console.error(error);
+            this.errorText.set(this.resolveErrorMessage(error, 'Unable to load the previous messages.'));
+            return of<ChatMessage[]>([]);
+          })
+        )
         .subscribe((history) => {
+          if (!history.length) {
+            return;
+          }
           this.messages.update((current) => this.mergeMessages(current, history));
           if (history.some((msg) => msg.sender?.type?.toUpperCase() === 'AGENT')) {
             this.stage.set(ChatStage.Active);
             this.setComposerEnabled(true);
           }
+          this.scrollHistoryToBottom();
         })
     );
   }
@@ -402,6 +455,13 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   private resolveErrorMessage(error: unknown, fallback: string): string {
+    if (error instanceof HttpErrorResponse) {
+      const resolved = this.resolveHttpError(error);
+      if (resolved) {
+        return resolved;
+      }
+    }
+
     if (error && typeof error === 'object') {
       if ('error' in error) {
         const payload = (error as any).error;
@@ -417,6 +477,39 @@ export class AppComponent implements OnInit, OnDestroy {
       }
     }
     return fallback;
+  }
+
+  private resolveHttpError(error: HttpErrorResponse): string | null {
+    if (error.status === 0) {
+      return 'We’re having trouble reaching our servers. Please check your connection and try again.';
+    }
+
+    switch (error.status) {
+      case 401:
+      case 403:
+        return 'We could not verify your session. Please restart the chat.';
+      case 404:
+        return 'This chat is no longer available. Please start a new conversation.';
+      case 409:
+        return 'Another agent is already helping with this conversation.';
+      case 422:
+        return 'We could not process your request. Try again in a moment.';
+    }
+
+    const payload = error.error;
+    if (typeof payload === 'string' && payload.trim()) {
+      return payload;
+    }
+    if (payload && typeof payload === 'object') {
+      if ('message' in payload && typeof payload.message === 'string') {
+        return payload.message;
+      }
+      if ('error' in payload && typeof payload.error === 'string') {
+        return payload.error;
+      }
+    }
+
+    return error.message || null;
   }
 
   private setComposerEnabled(enabled: boolean): void {
@@ -485,6 +578,21 @@ export class AppComponent implements OnInit, OnDestroy {
       console.warn('Failed to parse stored conversation', error);
     }
     return null;
+  }
+
+  private runAfterDomUpdate(task: () => void): void {
+    requestAnimationFrame(() => requestAnimationFrame(task));
+  }
+
+  private scrollHistoryToBottom(behavior: ScrollBehavior = 'auto'): void {
+    this.runAfterDomUpdate(() => {
+      const container =
+        this.historyContainers && this.historyContainers.length ? this.historyContainers.last?.nativeElement : undefined;
+      if (!container) {
+        return;
+      }
+      container.scrollTo({ top: container.scrollHeight, behavior });
+    });
   }
 
   private generateUuid(): string {

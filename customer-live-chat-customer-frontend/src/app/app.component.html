@@ -50,7 +50,7 @@
           *ngSwitchCase="ChatStage.Waiting"
           class="chat-session chat-session--waiting"
         >
-          <div class="chat-history" [class.chat-history--empty]="!messages().length">
+          <div class="chat-history" [class.chat-history--empty]="!messages().length" #historyContainer>
             <article
               *ngFor="let message of messages(); trackBy: trackByMessageId"
               [ngClass]="messageClasses(message)"
@@ -74,7 +74,7 @@
         </div>
 
         <div *ngSwitchCase="ChatStage.Active" class="chat-session">
-          <div class="chat-history">
+          <div class="chat-history" #historyContainer>
             <article
               *ngFor="let message of messages(); trackBy: trackByMessageId"
               [ngClass]="messageClasses(message)"
@@ -95,6 +95,7 @@
               placeholder="Type your message…"
               rows="3"
               [disabled]="!canSendMessages()"
+              (keydown.enter)="onComposerKeydown($event)"
             ></textarea>
             <div class="composer__actions">
               <button type="submit" class="btn btn-primary" [disabled]="messageForm.invalid || !canSendMessages() || isSending()">
@@ -105,7 +106,7 @@
         </div>
 
         <div *ngSwitchCase="ChatStage.Ended" class="chat-session chat-session--ended">
-          <div class="chat-history chat-history--inactive">
+          <div class="chat-history chat-history--inactive" #historyContainer>
             <article
               *ngFor="let message of messages(); trackBy: trackByMessageId"
               [ngClass]="messageClasses(message)"

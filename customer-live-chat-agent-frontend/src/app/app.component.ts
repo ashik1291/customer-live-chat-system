@@ -1,6 +1,18 @@
 import { CommonModule } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
-import { ChangeDetectionStrategy, Component, OnDestroy, OnInit, computed, inject, signal } from '@angular/core';
+import {
+  AfterViewInit,
+  ChangeDetectionStrategy,
+  Component,
+  ElementRef,
+  OnDestroy,
+  OnInit,
+  QueryList,
+  ViewChildren,
+  computed,
+  inject,
+  signal
+} from '@angular/core';
 import { FormBuilder, FormGroup, ReactiveFormsModule, Validators } from '@angular/forms';
 import { Subscription, catchError, interval, of, startWith, switchMap, take } from 'rxjs';
 import { ChatApiService } from './chat-api.service';
@@ -41,7 +53,7 @@ interface AgentChatSession {
   styleUrl: './app.component.scss',
   changeDetection: ChangeDetectionStrategy.OnPush
 })
-export class AppComponent implements OnInit, OnDestroy {
+export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
   readonly AgentStage = AgentStage;
   readonly maxConcurrentChats = 3;
 
@@ -68,6 +80,9 @@ export class AppComponent implements OnInit, OnDestroy {
     displayName: ['', [Validators.required, Validators.minLength(2)]]
   });
 
+  @ViewChildren('chatHistory') private chatHistories?: QueryList<ElementRef<HTMLDivElement>>;
+
+  private readonly chatHistoryMap = new Map<string, HTMLDivElement>();
   private queueSubscription?: Subscription;
 
   ngOnInit(): void {
@@ -78,6 +93,11 @@ export class AppComponent implements OnInit, OnDestroy {
       this.startQueuePolling();
       this.restoreActiveChats(stored);
     }
+  }
+
+  ngAfterViewInit(): void {
+    this.refreshChatHistoryMap();
+    this.chatHistories?.changes.subscribe(() => this.refreshChatHistoryMap());
   }
 
   ngOnDestroy(): void {
@@ -218,6 +238,15 @@ export class AppComponent implements OnInit, OnDestroy {
       });
   }
 
+  onComposerKeydown(event: KeyboardEvent, conversationId: string): void {
+    if (event.isComposing || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) {
+      return;
+    }
+
+    event.preventDefault();
+    this.sendMessage(conversationId);
+  }
+
   closeConversation(conversationId: string): void {
     const agent = this.agentSession();
     const chat = this.findChat(conversationId);
@@ -331,6 +360,7 @@ export class AppComponent implements OnInit, OnDestroy {
         });
         this.chatError.set(null);
         this.loadHistory(conversation.id, agent.agentId);
+        this.scrollChatToBottom(conversation.id, 'smooth');
       },
       error: (error) => this.setChatError(conversation.id, error.message ?? 'Unable to connect to chat service.')
     });
@@ -366,6 +396,7 @@ export class AppComponent implements OnInit, OnDestroy {
           session.stage = AgentStage.Active;
           session.isConnecting = false;
         });
+        this.scrollChatToBottom(conversationId);
       });
   }
 
@@ -386,6 +417,7 @@ export class AppComponent implements OnInit, OnDestroy {
         session.isSending = false;
       }
     });
+    this.scrollChatToBottom(conversationId, 'smooth');
   }
 
   private onChatDisconnected(conversationId: string): void {
@@ -600,6 +632,32 @@ export class AppComponent implements OnInit, OnDestroy {
     }
 
     return error.message || null;
+  }
+
+  private refreshChatHistoryMap(): void {
+    this.chatHistoryMap.clear();
+    this.chatHistories?.forEach((ref) => {
+      const element = ref.nativeElement;
+      const conversationId = element.dataset['conversationId'];
+      if (conversationId) {
+        this.chatHistoryMap.set(conversationId, element);
+      }
+    });
+  }
+
+  private runAfterDomUpdate(task: () => void): void {
+    requestAnimationFrame(() => requestAnimationFrame(task));
+  }
+
+  private scrollChatToBottom(conversationId: string, behavior: ScrollBehavior = 'auto'): void {
+    this.runAfterDomUpdate(() => {
+      this.refreshChatHistoryMap();
+      const element = this.chatHistoryMap.get(conversationId);
+      if (!element) {
+        return;
+      }
+      element.scrollTo({ top: element.scrollHeight, behavior });
+    });
   }
 }
 

@@ -169,7 +169,12 @@
                 <p>Connecting to the customer…</p>
               </div>
 
-              <div class="chat-history" [class.chat-history--empty]="!chat.messages.length">
+        <div
+          class="chat-history"
+          [class.chat-history--empty]="!chat.messages.length"
+          #chatHistory
+          [attr.data-conversation-id]="chat.id"
+        >
                 <article
                   *ngFor="let message of chat.messages; trackBy: trackMessage"
                   [ngClass]="messageClasses(message)"
@@ -198,6 +203,7 @@
                   rows="3"
                   placeholder="Write a reply…"
                   [disabled]="chat.stage !== AgentStage.Active || chat.isSending"
+            (keydown.enter)="onComposerKeydown($event, chat.id)"
                 ></textarea>
                 <div class="composer__actions">
                   <button
