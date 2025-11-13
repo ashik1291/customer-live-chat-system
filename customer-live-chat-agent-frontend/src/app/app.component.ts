@@ -17,7 +17,7 @@ import { FormBuilder, FormGroup, ReactiveFormsModule, Validators } from '@angula
 import { Subscription, catchError, interval, of, startWith, switchMap, take } from 'rxjs';
 import { ChatApiService } from './chat-api.service';
 import { AgentSocketConnection, ChatSocketService } from './chat-socket.service';
-import { ChatMessage, ConversationMetadata, QueueEntry } from './models';
+import { ChatMessage, ChatParticipant, ConversationMetadata, QueueEntry } from './models';
 
 enum AgentStage {
   Idle = 'IDLE',
@@ -68,6 +68,22 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
   readonly queueError = signal<string | null>(null);
   readonly chatError = signal<string | null>(null);
   readonly isConnecting = signal(false);
+  readonly queuePage = signal(0);
+  readonly queuePageSize = 8;
+
+  readonly paginatedQueue = computed(() => {
+    const entries = this.queue();
+    if (!entries.length) {
+      return [];
+    }
+    const start = this.queuePage() * this.queuePageSize;
+    return entries.slice(start, start + this.queuePageSize);
+  });
+
+  readonly totalQueuePages = computed(() => {
+    const total = this.queue().length;
+    return total ? Math.ceil(total / this.queuePageSize) : 1;
+  });
 
   readonly statusText = computed(() =>
     this.activeChats().length
@@ -132,6 +148,7 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
     this.agentSession.set(null);
     this.queue.set([]);
     this.queueActionErrors.set({});
+    this.queuePage.set(0);
     localStorage.removeItem('agentSession');
   }
 
@@ -196,6 +213,7 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
       .subscribe((entries) => {
         this.queueError.set(null);
         this.queue.set(entries);
+        this.ensureQueuePageInRange(entries.length);
         this.pruneQueueActionErrors(entries);
       });
   }
@@ -277,7 +295,7 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
       .subscribe(() => {
         this.updateChatSession(conversationId, (session) => {
           session.isSending = false;
-          session.statusText = 'Conversation closed. Waiting for confirmation.';
+          session.statusText = 'Closed';
         });
         this.refreshQueue();
       });
@@ -299,6 +317,21 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
     return entry.conversationId;
   }
 
+  queuePriority(entry: QueueEntry): number | null {
+    const entries = this.queue();
+    const index = entries.findIndex((item) => item.conversationId === entry.conversationId);
+    if (index === -1) {
+      return null;
+    }
+    return index + 1;
+  }
+
+  queueCustomerLabel(entry: QueueEntry): string {
+    const name = entry.customerName?.trim() || entry.customerId || 'Guest';
+    const phone = entry.customerPhone?.trim();
+    return phone ? `${name} (${phone})` : name;
+  }
+
   trackMessage(_index: number, message: ChatMessage): string {
     return message.id;
   }
@@ -317,6 +350,46 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
     };
   }
 
+  renderMessageSender(message: ChatMessage): string {
+    const senderType = message.sender?.type?.toUpperCase();
+    if (senderType === 'AGENT') {
+      if (message.sender?.id === this.agentSession()?.agentId) {
+        return 'You (Agent)';
+      }
+      return `${message.sender?.displayName || 'Agent'} (Agent)`;
+    }
+    if (senderType === 'CUSTOMER') {
+      return `${message.sender?.displayName || 'Customer'} (Customer)`;
+    }
+    if (senderType === 'SYSTEM') {
+      return 'System';
+    }
+    return message.sender?.displayName || 'Participant';
+  }
+
+  customerDisplayLabel(chat: AgentChatSession): string {
+    const customer = chat.conversation?.customer;
+    const base = customer?.displayName || customer?.id || 'Customer';
+    const role =
+      typeof customer?.metadata?.['role'] === 'string'
+        ? (customer.metadata['role'] as string)
+        : 'customer';
+    const capitalized = role.charAt(0).toUpperCase() + role.slice(1).toLowerCase();
+    return `${base} (${capitalized})`;
+  }
+
+  customerPhone(chat: AgentChatSession): string | null {
+    const metadata = chat.conversation?.customer?.metadata;
+    if (!metadata) {
+      return null;
+    }
+    const phone = metadata['phone'] as string | undefined;
+    if (phone && phone.trim().length) {
+      return phone.trim();
+    }
+    return null;
+  }
+
   private openConversationSession(conversation: ConversationMetadata, agent: AgentSession): void {
     const connection = this.sockets.createConnection({
       agentId: agent.agentId,
@@ -333,7 +406,7 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
       id: conversation.id,
       conversation,
       stage: AgentStage.Connecting,
-      statusText: 'Connecting to the customer...',
+      statusText: 'Connecting',
       messages: [],
       messageForm,
       isSending: false,
@@ -350,11 +423,7 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
         this.updateChatSession(conversation.id, (session) => {
           session.conversation = handshake.conversation;
           session.stage = AgentStage.Active;
-          session.statusText = `You are now connected with ${
-            handshake.conversation.customer?.displayName ||
-            handshake.conversation.customer?.id ||
-            'the customer'
-          }.`;
+          session.statusText = 'Connected';
           session.isConnecting = false;
           session.messageForm.enable({ emitEvent: false });
         });
@@ -395,27 +464,61 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
           session.messages = this.mergeMessages(session.messages, history);
           session.stage = AgentStage.Active;
           session.isConnecting = false;
+          session.statusText = 'Connected';
         });
         this.scrollChatToBottom(conversationId);
       });
   }
 
   private handleIncomingMessage(conversationId: string, message: ChatMessage): void {
+    const senderType = message.sender?.type?.toUpperCase();
+    const messageType = message.type?.toUpperCase();
+    const metadata = message.metadata || {};
+    let normalized: ChatMessage = message;
+
     this.updateChatSession(conversationId, (session) => {
-      session.messages = this.mergeMessages(session.messages, [message]);
-
-      const senderType = message.sender?.type?.toUpperCase();
-      if (senderType === 'CUSTOMER') {
-        session.statusText = `${message.sender?.displayName || 'Customer'} is waiting for your reply.`;
+      if (messageType === 'SYSTEM') {
+        const event = typeof metadata['event'] === 'string' ? metadata['event'].toUpperCase() : null;
+        if (event === 'CHAT_CLOSED') {
+          const closedByType =
+            typeof metadata['closedByType'] === 'string' ? metadata['closedByType'].toUpperCase() : '';
+          let display: string;
+          if (closedByType === 'CUSTOMER') {
+            const customerName =
+              (typeof metadata['closedByDisplayName'] === 'string'
+                ? metadata['closedByDisplayName'].trim()
+                : '') ||
+              session.conversation?.customer?.displayName ||
+              'Customer';
+            display = `${customerName} ended the chat.`;
+            session.statusText = 'Disconnected';
+          } else if (closedByType === 'AGENT') {
+            display = 'You closed this chat.';
+            session.statusText = 'Closed';
+          } else {
+            const fallback = message.content || 'The chat was closed.';
+            display = fallback;
+            session.statusText = 'Closed';
+          }
+          normalized = { ...message, content: display };
+          session.messageForm.disable({ emitEvent: false });
+          session.connection.disconnect();
+          session.stage = AgentStage.Ended;
+          session.isSending = false;
+        } else {
+          const closing = message.content || 'The chat was closed.';
+          normalized = { ...message, content: closing };
+          session.messageForm.disable({ emitEvent: false });
+          session.connection.disconnect();
+          session.stage = AgentStage.Ended;
+          session.statusText = 'Closed';
+          session.isSending = false;
+        }
+      } else if (session.stage === AgentStage.Active) {
+        session.statusText = 'Connected';
       }
 
-      if (message.type?.toUpperCase() === 'SYSTEM') {
-        session.messageForm.disable({ emitEvent: false });
-        session.connection.disconnect();
-        session.stage = AgentStage.Ended;
-        session.statusText = message.content || 'The chat was closed.';
-        session.isSending = false;
-      }
+      session.messages = this.mergeMessages(session.messages, [normalized]);
     });
     this.scrollChatToBottom(conversationId, 'smooth');
   }
@@ -428,6 +531,7 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
       session.messageForm.disable({ emitEvent: false });
       session.errorText = 'Connection lost. Reopen the conversation if you need to continue.';
       session.stage = AgentStage.Ended;
+      session.statusText = 'Disconnected';
       session.isSending = false;
     });
   }
@@ -499,6 +603,34 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
     });
   }
 
+  nextQueuePage(): void {
+    const next = this.queuePage() + 1;
+    if (next < this.totalQueuePages()) {
+      this.queuePage.set(next);
+    }
+  }
+
+  previousQueuePage(): void {
+    const prev = this.queuePage() - 1;
+    if (prev >= 0) {
+      this.queuePage.set(prev);
+    }
+  }
+
+  goToQueuePage(index: number): void {
+    if (index < 0 || index >= this.totalQueuePages()) {
+      return;
+    }
+    this.queuePage.set(index);
+  }
+
+  private ensureQueuePageInRange(totalEntries: number): void {
+    const totalPages = totalEntries ? Math.ceil(totalEntries / this.queuePageSize) : 1;
+    if (this.queuePage() >= totalPages) {
+      this.queuePage.set(Math.max(0, totalPages - 1));
+    }
+  }
+
   private startQueuePolling(): void {
     this.stopQueuePolling();
     this.refreshQueue();
@@ -519,6 +651,7 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
       .subscribe((entries) => {
         this.queueError.set(null);
         this.queue.set(entries);
+        this.ensureQueuePageInRange(entries.length);
         this.pruneQueueActionErrors(entries);
       });
   }
@@ -659,6 +792,11 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
       element.scrollTo({ top: element.scrollHeight, behavior });
     });
   }
+
+  private formatCustomerStatus(_participant: ChatParticipant | null | undefined): string {
+    return 'Connected';
+  }
+
 }
 
 

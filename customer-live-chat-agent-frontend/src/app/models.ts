@@ -34,6 +34,8 @@ export interface QueueEntry {
   conversationId: string;
   enqueuedAt?: string;
   customerId?: string;
+  customerName?: string;
+  customerPhone?: string;
   channel?: string;
 }
 

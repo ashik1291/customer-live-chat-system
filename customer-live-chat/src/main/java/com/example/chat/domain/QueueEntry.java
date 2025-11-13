@@ -17,5 +17,7 @@ public class QueueEntry implements Serializable {
     private Instant enqueuedAt;
     private String customerId;
     private String channel;
+    private String customerName;
+    private String customerPhone;
 }
 

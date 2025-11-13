@@ -38,9 +38,11 @@ public class ParticipantIdentityService {
             throw new IllegalArgumentException("Participant identifier is required");
         }
 
-        Map<String, Object> safeMetadata = metadata == null || metadata.isEmpty()
-                ? Map.of()
-                : new HashMap<>(metadata);
+        Map<String, Object> safeMetadata = new HashMap<>();
+        if (metadata != null && !metadata.isEmpty()) {
+            safeMetadata.putAll(metadata);
+        }
+        safeMetadata.putIfAbsent("role", type.name().toLowerCase());
 
         String resolvedName;
         if (StringUtils.hasText(displayName)) {

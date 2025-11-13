@@ -43,6 +43,15 @@ export class ChatApiService {
     });
   }
 
+  closeConversation(conversationId: string, customerId: string): Observable<ConversationMetadata> {
+    const headers = new HttpHeaders({
+      'X-Participant-Id': customerId
+    });
+    return this.http.delete<ConversationMetadata>(`${this.baseUrl}/api/conversations/${conversationId}`, {
+      headers
+    });
+  }
+
   private buildParticipantHeaders(participantId?: string, displayName?: string): HttpHeaders {
     let headers = new HttpHeaders();
     if (participantId) {

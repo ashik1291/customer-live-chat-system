@@ -22,8 +22,7 @@
   </section>
 
   <ng-template #dashboard>
-    <div class="console-layout">
-      <div class="console">
+    <div class="console">
       <header class="console__header">
         <div class="console__titles">
           <h1>Agent Desk</h1>
@@ -38,55 +37,50 @@
         </div>
       </header>
 
-      <section class="queue-card">
-        <div class="queue-card__header">
-          <div>
-            <h2>Live Requests</h2>
-            <p>Customers waiting for assistance</p>
+      <div class="workspace-layout">
+        <section class="queue-panel">
+          <div class="queue-panel__header">
+            <div>
+              <h2>Live Requests</h2>
+              <p>Customers waiting for assistance</p>
+            </div>
+            <div class="queue-panel__actions">
+              <span class="badge">{{ queue().length }}</span>
+              <button type="button" class="icon-button" (click)="refreshQueue()" aria-label="Refresh queue">↻</button>
+            </div>
           </div>
-          <div class="queue-card__actions">
-            <span class="badge">{{ queue().length }}</span>
-            <button type="button" class="icon-button" (click)="refreshQueue()" aria-label="Refresh queue">↻</button>
-          </div>
-        </div>
 
-        <div class="queue-card__body">
-          <p class="panel-error" *ngIf="queueError()">{{ queueError() }}</p>
-          <p class="panel-hint" *ngIf="activeChats().length >= maxConcurrentChats">
-            Maximum concurrent chats reached. Close a chat to accept another.
-          </p>
+          <div class="queue-panel__body">
+            <p class="panel-error" *ngIf="queueError()">{{ queueError() }}</p>
+          <p class="panel-error" *ngIf="chatError()">{{ chatError() }}</p>
+            <p class="panel-hint" *ngIf="activeChats().length >= maxConcurrentChats">
+              Maximum concurrent chats reached. Close a chat to accept another.
+            </p>
 
-          <table class="queue-table" *ngIf="queue().length; else emptyQueue">
-            <thead>
-              <tr>
-                <th>Customer</th>
-                <th>Channel</th>
-                <th>Waiting Since</th>
-                <th>Conversation</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr *ngFor="let entry of queue(); trackBy: trackQueue">
-                <td>
-                  <div class="customer-pill">
-                    <strong>{{ entry.customerId || 'Guest Visitor' }}</strong>
-                    <small>Assigned on accept</small>
+            <div class="queue-cards" *ngIf="queue().length; else emptyQueue">
+              <article class="queue-card" *ngFor="let entry of paginatedQueue(); trackBy: trackQueue">
+                <header class="queue-card__header">
+                  <span class="priority-badge">{{ queuePriority(entry) || '—' }}</span>
+                  <div class="queue-card__meta">
+                    <span class="channel-tag">{{ (entry.channel || 'web') | uppercase }}</span>
+                    <span class="queue-card__time">
+                      {{ entry.enqueuedAt ? (entry.enqueuedAt | date : 'shortTime') : '—' }}
+                    </span>
                   </div>
-                </td>
-                <td>
-                  <span class="channel-tag">{{ (entry.channel || 'web') | uppercase }}</span>
-                </td>
-                <td>
-                  {{ entry.enqueuedAt ? (entry.enqueuedAt | date : 'shortTime') : '—' }}
-                </td>
-                <td>
-                  <code class="conversation-id">{{ entry.conversationId }}</code>
-                </td>
-                <td class="actions-cell">
+                </header>
+                <section class="queue-card__body">
+                  <div class="queue-card__customer">
+                    <strong class="queue-card__name">{{ queueCustomerLabel(entry) }}</strong>
+                    <div class="queue-card__visitor">
+                      <span class="queue-card__label">Visitor ID</span>
+                      <span class="queue-card__value">{{ entry.conversationId }}</span>
+                    </div>
+                  </div>
+                </section>
+                <footer class="queue-card__footer">
                   <button
                     type="button"
-                    class="btn btn-primary"
+                    class="btn btn-primary btn--compact"
                     (click)="joinConversation(entry)"
                     [disabled]="isConnecting() || activeChats().length >= maxConcurrentChats"
                   >
@@ -95,134 +89,114 @@
                   <div class="queue-row__error" *ngIf="queueActionErrors()[entry.conversationId]">
                     {{ queueActionErrors()[entry.conversationId] }}
                   </div>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-
-          <ng-template #emptyQueue>
-            <div class="empty-state">
-              <p>No customers are waiting right now. We’ll refresh the queue automatically.</p>
+                </footer>
+              </article>
             </div>
-          </ng-template>
-        </div>
-      </section>
 
-      <section class="chat-summary">
-        <header>
-          <h2>Active Chats</h2>
-          <span>{{ activeChats().length }}/{{ maxConcurrentChats }}</span>
-        </header>
+            <ng-template #emptyQueue>
+              <div class="empty-state">
+                <p>No customers are waiting right now. We’ll refresh the queue automatically.</p>
+              </div>
+            </ng-template>
 
-        <p class="panel-error" *ngIf="chatError()">{{ chatError() }}</p>
-
-        <div *ngIf="!activeChats().length" class="chat-summary__empty">
-          <p>Select a chat request from the queue to begin.</p>
-        </div>
-
-        <ul *ngIf="activeChats().length">
-          <li *ngFor="let chat of activeChats(); trackBy: trackChat">
-            <div class="chat-summary__info">
-              <strong>{{ chat.conversation?.customer?.displayName || chat.conversation?.customer?.id || 'Customer' }}</strong>
-              <small>Conversation {{ chat.id }}</small>
-            </div>
-            <div class="chat-summary__status" [class.chat-summary__status--ended]="chat.stage === AgentStage.Ended">
-              {{ chat.statusText }}
-            </div>
-            <div class="chat-summary__actions">
+            <div class="queue-pagination" *ngIf="totalQueuePages() > 1">
+              <button type="button" class="icon-button" (click)="previousQueuePage()" [disabled]="queuePage() === 0">
+                ‹
+              </button>
+              <span>Page {{ queuePage() + 1 }} of {{ totalQueuePages() }}</span>
               <button
                 type="button"
-                class="btn btn-secondary"
-                *ngIf="chat.stage === AgentStage.Ended"
-                (click)="dismissChat(chat.id)"
+                class="icon-button"
+                (click)="nextQueuePage()"
+                [disabled]="queuePage() + 1 >= totalQueuePages()"
               >
-                Dismiss
+                ›
               </button>
             </div>
-          </li>
-        </ul>
-      </section>
-      </div>
-      <section class="chat-popups" *ngIf="activeChats().length">
-        <div class="chat-popup" *ngFor="let chat of activeChats(); trackBy: trackChat">
-          <div class="chat-widget" [class.chat-widget--ended]="chat.stage === AgentStage.Ended">
-            <header class="chat-widget__header">
-              <div class="chat-widget__heading">
-                <span class="chat-widget__badge">Live Chat</span>
-                <h2>{{ chat.conversation?.customer?.displayName || chat.conversation?.customer?.id || 'Customer chat' }}</h2>
-                <p>{{ chat.statusText }}</p>
-              </div>
-              <button
-                type="button"
-                class="close-button"
-                (click)="chat.stage === AgentStage.Ended ? dismissChat(chat.id) : closeConversation(chat.id)"
-                [disabled]="chat.isSending || chat.isConnecting"
-                aria-label="Close chat"
-              >
-                {{ chat.stage === AgentStage.Ended ? 'Dismiss' : 'Close' }}
-              </button>
-            </header>
+          </div>
 
-            <div class="chat-widget__body">
-              <div class="chat-connecting" *ngIf="chat.isConnecting">
-                <span class="spinner" aria-hidden="true"></span>
-                <p>Connecting to the customer…</p>
-              </div>
+        </section>
 
-        <div
-          class="chat-history"
-          [class.chat-history--empty]="!chat.messages.length"
-          #chatHistory
-          [attr.data-conversation-id]="chat.id"
-        >
-                <article
-                  *ngFor="let message of chat.messages; trackBy: trackMessage"
-                  [ngClass]="messageClasses(message)"
-                >
-                  <header>
-                    <span class="sender">
-                      {{ message.sender?.displayName || (message.sender?.type === 'CUSTOMER' ? 'Customer' : 'You') }}
-                    </span>
-                    <time>{{ message.timestamp | date : 'shortTime' }}</time>
-                  </header>
-                  <p>{{ message.content }}</p>
-                </article>
-
-                <div class="chat-history__placeholder" *ngIf="!chat.messages.length && !chat.isConnecting">
-                  <p>No messages yet — say hello to start the conversation.</p>
+        <section class="chat-popups" *ngIf="activeChats().length">
+          <div class="chat-popup" *ngFor="let chat of activeChats(); trackBy: trackChat">
+            <div class="chat-widget" [class.chat-widget--ended]="chat.stage === AgentStage.Ended">
+              <header class="chat-widget__header">
+                <div class="chat-widget__identity">
+                  <h2>{{ customerDisplayLabel(chat) }}</h2>
                 </div>
-              </div>
-
-              <div class="chat-error" *ngIf="chat.errorText">{{ chat.errorText }}</div>
-
-              <form class="composer" [formGroup]="chat.messageForm" (ngSubmit)="sendMessage(chat.id)">
-                <label class="sr-only" for="agent-message-{{ chat.id }}">Type your message</label>
-                <textarea
-                  id="agent-message-{{ chat.id }}"
-                  formControlName="content"
-                  rows="3"
-                  placeholder="Write a reply…"
-                  [disabled]="chat.stage !== AgentStage.Active || chat.isSending"
-            (keydown.enter)="onComposerKeydown($event, chat.id)"
-                ></textarea>
-                <div class="composer__actions">
+                <div class="chat-widget__header-actions">
+                  <span class="chat-widget__status">{{ chat.statusText }}</span>
                   <button
-                    type="submit"
-                    class="btn btn-primary"
-                    [disabled]="chat.messageForm.invalid || chat.stage !== AgentStage.Active || chat.isSending"
+                    type="button"
+                    class="close-button"
+                    (click)="chat.stage === AgentStage.Ended ? dismissChat(chat.id) : closeConversation(chat.id)"
+                    [disabled]="chat.isSending || chat.isConnecting"
+                    aria-label="Close chat"
                   >
-                    {{ chat.isSending ? 'Sending…' : 'Send' }}
+                    {{ chat.stage === AgentStage.Ended ? 'Dismiss' : 'Close' }}
                   </button>
                 </div>
-              </form>
+              </header>
 
-              <div class="chat-widget__footer" *ngIf="chat.stage === AgentStage.Ended">
-                <p>This chat is closed. Dismiss it or pick another request from the queue.</p>
+              <div class="chat-widget__body">
+                <div class="chat-connecting" *ngIf="chat.isConnecting">
+                  <span class="spinner" aria-hidden="true"></span>
+                  <p>Connecting to the customer…</p>
+                </div>
+
+                <div
+                  class="chat-history"
+                  [class.chat-history--empty]="!chat.messages.length"
+                  #chatHistory
+                  [attr.data-conversation-id]="chat.id"
+                >
+                  <article
+                    *ngFor="let message of chat.messages; trackBy: trackMessage"
+                    [ngClass]="messageClasses(message)"
+                  >
+                    <header>
+                      <span class="sender">{{ renderMessageSender(message) }}</span>
+                      <time>{{ message.timestamp | date : 'shortTime' }}</time>
+                    </header>
+                    <p>{{ message.content }}</p>
+                  </article>
+
+                  <div class="chat-history__placeholder" *ngIf="!chat.messages.length && !chat.isConnecting">
+                    <p>No messages yet — say hello to start the conversation.</p>
+                  </div>
+                </div>
+
+                <div class="chat-error" *ngIf="chat.errorText">{{ chat.errorText }}</div>
+
+                <form class="composer" [formGroup]="chat.messageForm" (ngSubmit)="sendMessage(chat.id)">
+                  <label class="sr-only" for="agent-message-{{ chat.id }}">Type your message</label>
+                  <textarea
+                    id="agent-message-{{ chat.id }}"
+                    formControlName="content"
+                    rows="3"
+                    placeholder="Write a reply…"
+                    [disabled]="chat.stage !== AgentStage.Active || chat.isSending"
+                    (keydown.enter)="onComposerKeydown($event, chat.id)"
+                  ></textarea>
+                  <div class="composer__actions">
+                    <button
+                      type="submit"
+                      class="btn btn-primary"
+                      [disabled]="chat.messageForm.invalid || chat.stage !== AgentStage.Active || chat.isSending"
+                    >
+                      {{ chat.isSending ? 'Sending…' : 'Send' }}
+                    </button>
+                  </div>
+                </form>
+
+                <div class="chat-widget__footer" *ngIf="chat.stage === AgentStage.Ended">
+                  <p>This chat is closed. Dismiss it or pick another request from the queue.</p>
+                </div>
               </div>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
+      </div>
     </div>
   </ng-template>
 </div>

@@ -37,11 +37,13 @@ enum ChatStage {
 interface StoredCustomerSession {
   token: string;
   displayName: string;
+  phone?: string;
 }
 
 interface StoredConversationState {
   conversation: ConversationMetadata;
   customerId: string;
+  queueStatus?: QueueStatusResponse | null;
 }
 
 @Component({
@@ -75,6 +77,11 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
 
   readonly canSendMessages = computed(() => this.stage() === ChatStage.Active);
 
+  readonly prechatForm = this.fb.group({
+    displayName: [''],
+    phone: ['']
+  });
+
   readonly messageForm = this.fb.group({
     content: ['', [Validators.required, Validators.minLength(1)]]
   });
@@ -87,6 +94,10 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
 
   ngOnInit(): void {
     this.session = this.ensureSession();
+    this.prechatForm.patchValue({
+      displayName: this.session.displayName,
+      phone: this.session.phone ?? ''
+    });
     this.setComposerEnabled(false);
     this.openWidget();
     this.restoreActiveConversation();
@@ -124,20 +135,29 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
     this.stage.set(ChatStage.Connecting);
     this.statusText.set('Connecting you with our support team...');
 
+    const displayName =
+      this.prechatForm.controls.displayName.value?.trim() ||
+      this.session.displayName ||
+      'Visitor';
+    const phone = this.prechatForm.controls.phone.value?.trim() || this.session.phone || '';
+    this.session = { ...this.session, displayName, phone };
+    this.persistSession();
+
     const payload: CreateConversationPayload = {
       channel: 'web',
-      displayName: this.session.displayName
+      displayName,
+      phone
     };
 
     const start$ = this.api
-      .createConversation(payload)
+      .createConversation(payload, this.session.token, displayName)
       .pipe(
         take(1),
         switchMap((conversation) => {
           const customerId = conversation.customer?.id ?? this.session.token;
           this.participantId.set(customerId);
           this.conversation.set(conversation);
-          this.persistActiveConversation(conversation, customerId);
+          this.persistActiveConversation(conversation, customerId, this.queueStatus());
           this.messages.set([
             this.createSystemMessage(
               conversation.id,
@@ -181,6 +201,11 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
       start$.subscribe((queueStatus) => {
         if (queueStatus) {
           this.queueStatus.set(queueStatus);
+          const conversation = this.conversation();
+          const customerId = this.participantId();
+          if (conversation && customerId) {
+            this.persistActiveConversation(conversation, customerId, queueStatus);
+          }
         }
       })
     );
@@ -226,7 +251,7 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
     this.sendMessage();
   }
 
-  restartChat(): void {
+  restartChat(autoStart = false): void {
     this.socket.disconnect();
     this.clearSocketSubscriptions();
     this.clearActiveSubscriptions();
@@ -239,6 +264,62 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
     this.stage.set(ChatStage.Confirm);
     this.setComposerEnabled(false);
     this.clearStoredActiveConversation();
+    if (autoStart) {
+      this.runAfterDomUpdate(() => this.startConversation());
+    }
+  }
+
+  private resetToPrechat(message?: string): void {
+    this.socket.disconnect();
+    this.clearSocketSubscriptions();
+    this.clearActiveSubscriptions();
+    this.messages.set([]);
+    this.queueStatus.set(null);
+    this.conversation.set(null);
+    this.participantId.set(null);
+    this.stage.set(ChatStage.Confirm);
+    this.statusText.set(this.greetingText);
+    this.setComposerEnabled(false);
+    this.clearStoredActiveConversation();
+    if (message) {
+      this.errorText.set(message);
+    }
+  }
+
+  closeConversation(): void {
+    if (this.isSending()) {
+      return;
+    }
+    const conversation = this.conversation();
+    const customerId = this.participantId();
+    if (!conversation || !customerId) {
+      return;
+    }
+
+    this.isSending.set(true);
+    this.api
+      .closeConversation(conversation.id, customerId)
+      .pipe(
+        take(1),
+        catchError((error) => {
+          console.error(error);
+          this.errorText.set(this.resolveErrorMessage(error, 'Unable to close the conversation right now.'));
+          return of<ConversationMetadata | null>(null);
+        }),
+        finalize(() => this.isSending.set(false))
+      )
+      .subscribe((result) => {
+        if (!result) {
+          return;
+        }
+        this.socket.disconnect();
+        this.clearSocketSubscriptions();
+        this.clearActiveSubscriptions();
+        this.clearStoredActiveConversation();
+        this.stage.set(ChatStage.Ended);
+        this.statusText.set('Chat ended. Start a new chat if you need more help.');
+        this.setComposerEnabled(false);
+      });
   }
 
   trackByMessageId(_index: number, item: ChatMessage): string {
@@ -253,6 +334,24 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
       'message-customer': senderType === 'CUSTOMER',
       'message-system': senderType === 'SYSTEM'
     };
+  }
+
+  renderSenderLabel(message: ChatMessage): string {
+    const senderType = message.sender?.type?.toUpperCase();
+    const displayName = message.sender?.displayName;
+    switch (senderType) {
+      case 'AGENT':
+        return `${displayName || 'Agent'} (Agent)`;
+      case 'CUSTOMER':
+        if (message.sender?.id === this.participantId()) {
+          return 'You';
+        }
+        return `${displayName || 'Customer'} (Customer)`;
+      case 'SYSTEM':
+        return 'System';
+      default:
+        return displayName || 'Participant';
+    }
   }
 
   formatEstimate(duration?: string | null): string | null {
@@ -296,6 +395,7 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
         this.conversation.set(handshake.conversation);
         this.participantId.set(handshake.participant.id);
         this.persistActiveConversation(handshake.conversation, handshake.participant.id);
+        this.persistSession();
         this.loadHistory(handshake.conversation.id);
       })
     );
@@ -305,7 +405,12 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
     );
 
     this.socketSubscriptions.push(
-      this.socket.onError().subscribe((error) => this.errorText.set(error))
+      this.socket.onError().subscribe((error) => {
+        this.errorText.set(error);
+        if (this.stage() === ChatStage.Waiting || this.stage() === ChatStage.Connecting) {
+          this.resetToPrechat(error);
+        }
+      })
     );
 
     this.socketSubscriptions.push(
@@ -321,28 +426,58 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
 
   private handleIncomingMessage(message: ChatMessage): void {
     const senderType = message.sender?.type?.toUpperCase();
+    const messageType = message.type?.toUpperCase();
+    const metadata = message.metadata || {};
+    const conversation = this.conversation();
+
     let normalized: ChatMessage = message;
 
     if (senderType === 'AGENT') {
       this.stage.set(ChatStage.Active);
       this.queueStatus.set(null);
-      const agentName = message.sender?.displayName || 'our agent';
-      this.statusText.set(`You're now chatting with ${agentName}.`);
+      const agentName = message.sender?.displayName || conversation?.agent?.displayName || 'our agent';
+      this.statusText.set(`You're now chatting with ${agentName} (Agent).`);
       this.setComposerEnabled(true);
     }
 
-    if (message.type?.toUpperCase() === 'SYSTEM') {
-      const closing = message.content?.trim()
-        ? message.content
-        : 'Thanks for chatting with us! Feel free to start a new conversation whenever you need help.';
-      normalized = { ...message, content: closing };
-      this.stage.set(ChatStage.Ended);
-      this.statusText.set(closing);
-      this.setComposerEnabled(false);
-      this.socket.disconnect();
-      this.clearSocketSubscriptions();
-      this.clearActiveSubscriptions();
-      this.clearStoredActiveConversation();
+    if (messageType === 'SYSTEM') {
+      const event = typeof metadata['event'] === 'string' ? metadata['event'].toUpperCase() : null;
+      if (event === 'CHAT_CLOSED') {
+        const closedByType =
+          typeof metadata['closedByType'] === 'string' ? metadata['closedByType'].toUpperCase() : '';
+        let display: string;
+        if (closedByType === 'CUSTOMER') {
+          display = 'You ended the chat. Start a new chat if you need more help.';
+        } else if (closedByType === 'AGENT') {
+          const agentName =
+            (typeof metadata['closedByDisplayName'] === 'string' && metadata['closedByDisplayName'].toString().trim()) ||
+            conversation?.agent?.displayName ||
+            'The agent';
+        display = `${agentName} (Agent) ended the chat.`;
+        } else {
+          display = 'Chat ended. Start a new chat if you need more help.';
+        }
+        normalized = { ...message, content: display };
+        this.stage.set(ChatStage.Ended);
+        this.statusText.set(display);
+        this.setComposerEnabled(false);
+        this.socket.disconnect();
+        this.clearSocketSubscriptions();
+        this.clearActiveSubscriptions();
+        this.clearStoredActiveConversation();
+      } else {
+        const closing = message.content?.trim()
+          ? message.content
+          : 'Thanks for chatting with us! Feel free to start a new conversation whenever you need help.';
+        normalized = { ...message, content: closing };
+        this.stage.set(ChatStage.Ended);
+        this.statusText.set(closing);
+        this.setComposerEnabled(false);
+        this.socket.disconnect();
+        this.clearSocketSubscriptions();
+        this.clearActiveSubscriptions();
+        this.clearStoredActiveConversation();
+      }
     }
 
     this.messages.update((current) => this.mergeMessages(current, [normalized]));
@@ -363,12 +498,26 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
         )
         .subscribe((history) => {
           if (!history.length) {
+            this.stage.set(ChatStage.Waiting);
+            this.statusText.set('We are finding the best available agent for you.');
+            const conversation = this.conversation();
+            if (conversation) {
+              this.messages.set([
+                this.createSystemMessage(
+                  conversation.id,
+                  'Please wait, our support agent will join you shortly.'
+                )
+              ]);
+            }
             return;
           }
           this.messages.update((current) => this.mergeMessages(current, history));
           if (history.some((msg) => msg.sender?.type?.toUpperCase() === 'AGENT')) {
             this.stage.set(ChatStage.Active);
             this.setComposerEnabled(true);
+          } else {
+            this.stage.set(ChatStage.Waiting);
+            this.statusText.set('We are finding the best available agent for you.');
           }
           this.scrollHistoryToBottom();
         })
@@ -444,7 +593,8 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
     }
     const session: StoredCustomerSession = {
       token: this.generateUuid(),
-      displayName: 'Visitor'
+      displayName: 'Visitor',
+      phone: ''
     };
     try {
       localStorage.setItem(storageKey, JSON.stringify(session));
@@ -529,11 +679,19 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
     }
 
     try {
+      if (!stored.conversation || stored.conversation.status === 'CLOSED') {
+        this.clearStoredActiveConversation();
+        return;
+      }
       this.isWidgetOpen.set(true);
       this.stage.set(ChatStage.Waiting);
       this.statusText.set('Restoring your conversation...');
-      this.queueStatus.set(null);
-      this.messages.set([]);
+      this.queueStatus.set(stored.queueStatus ?? null);
+      const placeholder = this.createSystemMessage(
+        stored.conversation.id,
+        'Please wait, our support agent will join you shortly.'
+      );
+      this.messages.set([placeholder]);
       this.conversation.set(stored.conversation);
       this.participantId.set(stored.customerId);
       this.setComposerEnabled(false);
@@ -544,15 +702,29 @@ export class AppComponent implements OnInit, OnDestroy, AfterViewInit {
     }
   }
 
-  private persistActiveConversation(conversation: ConversationMetadata, customerId: string): void {
+  private persistActiveConversation(
+    conversation: ConversationMetadata,
+    customerId: string,
+    queueStatus: QueueStatusResponse | null = this.queueStatus()
+  ): void {
     try {
       const state: StoredConversationState = {
         conversation,
-        customerId
+        customerId,
+        queueStatus
       };
       localStorage.setItem(this.activeConversationKey, JSON.stringify(state));
     } catch (error) {
       console.warn('Unable to persist active conversation', error);
+    }
+  }
+
+  private persistSession(): void {
+    try {
+      const storageKey = 'customer-chat-session';
+      localStorage.setItem(storageKey, JSON.stringify(this.session));
+    } catch (error) {
+      console.warn('Unable to persist session details', error);
     }
   }
 

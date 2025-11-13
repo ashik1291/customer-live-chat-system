@@ -19,7 +19,7 @@
       </button>
     </header>
 
-    <div class="chat-widget__status">
+    <div class="chat-widget__status" *ngIf="stage() !== ChatStage.Idle && stage() !== ChatStage.Confirm">
       <p>{{ statusText() }}</p>
     </div>
 
@@ -29,11 +29,22 @@
       </div>
 
       <ng-template #welcomeTemplate>
-        <div class="chat-greeting">
+        <form class="chat-greeting" [formGroup]="prechatForm" (ngSubmit)="startConversation()">
           <h3>Hi there! How can we help you today?</h3>
           <p>Start a real-time conversation with our support team in seconds.</p>
-          <button type="button" class="btn btn-primary" (click)="startConversation()">Start Chat</button>
-        </div>
+
+          <label>
+            <span>Name</span>
+            <input type="text" formControlName="displayName" placeholder="Your name" />
+          </label>
+
+          <label>
+            <span>Phone</span>
+            <input type="tel" formControlName="phone" placeholder="Phone number (optional)" />
+          </label>
+
+          <button type="submit" class="btn btn-primary">Start Chat</button>
+        </form>
       </ng-template>
 
       <ng-container [ngSwitch]="stage()">
@@ -56,7 +67,7 @@
               [ngClass]="messageClasses(message)"
             >
               <header>
-                <span class="sender">{{ message.sender?.displayName || (message.sender?.type === 'AGENT' ? 'Agent' : 'You') }}</span>
+                <span class="sender">{{ renderSenderLabel(message) }}</span>
                 <time>{{ message.timestamp | date : 'shortTime' }}</time>
               </header>
               <p>{{ message.content }}</p>
@@ -80,7 +91,7 @@
               [ngClass]="messageClasses(message)"
             >
               <header>
-                <span class="sender">{{ message.sender?.displayName || (message.sender?.type === 'AGENT' ? 'Agent' : 'You') }}</span>
+                <span class="sender">{{ renderSenderLabel(message) }}</span>
                 <time>{{ message.timestamp | date : 'shortTime' }}</time>
               </header>
               <p>{{ message.content }}</p>
@@ -101,6 +112,9 @@
               <button type="submit" class="btn btn-primary" [disabled]="messageForm.invalid || !canSendMessages() || isSending()">
                 {{ isSending() ? 'Sending...' : 'Send' }}
               </button>
+              <button type="button" class="btn btn-secondary" (click)="closeConversation()" [disabled]="isSending()">
+                End Chat
+              </button>
             </div>
           </form>
         </div>
@@ -112,7 +126,7 @@
               [ngClass]="messageClasses(message)"
             >
               <header>
-                <span class="sender">{{ message.sender?.displayName || (message.sender?.type === 'AGENT' ? 'Agent' : 'You') }}</span>
+                <span class="sender">{{ renderSenderLabel(message) }}</span>
                 <time>{{ message.timestamp | date : 'shortTime' }}</time>
               </header>
               <p>{{ message.content }}</p>
@@ -120,7 +134,7 @@
           </div>
           <div class="chat-session__footer">
             <p>The conversation has ended. Start a new chat anytime.</p>
-            <button type="button" class="btn btn-primary" (click)="restartChat()">Start New Chat</button>
+            <button type="button" class="btn btn-primary" (click)="restartChat(true)">Start New Chat</button>
           </div>
         </div>
 

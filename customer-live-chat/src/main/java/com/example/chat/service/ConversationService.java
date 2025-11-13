@@ -14,6 +14,7 @@ import com.example.chat.event.ChatEventType;
 import com.example.chat.event.ChatMessageEvent;
 import java.time.Instant;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -75,12 +76,16 @@ public class ConversationService {
         }
         conversationRepository.saveConversation(conversation);
         releaseAssignment(conversation.getId());
-        queueService.enqueue(QueueEntry.builder()
+
+        QueueEntry entry = QueueEntry.builder()
                 .conversationId(conversation.getId())
                 .customerId(conversation.getCustomer().getId())
+                .customerName(conversation.getCustomer().getDisplayName())
+                .customerPhone(resolveCustomerPhone(conversation))
                 .channel(channel)
                 .enqueuedAt(now)
-                .build());
+                .build();
+        queueService.enqueue(entry);
 
         eventPublisher.publishLifecycleEvent(ChatEvent.builder()
                 .eventId(UUID.randomUUID().toString())
@@ -263,6 +268,20 @@ public class ConversationService {
         Instant now = Instant.now();
 
         String closingMessage = resolveClosingMessage(conversation, closedBy);
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("event", "CHAT_CLOSED");
+        if (closedBy != null && closedBy.getType() != null) {
+            metadata.put("closedByType", closedBy.getType().name());
+            if (StringUtils.hasText(closedBy.getDisplayName())) {
+                metadata.put("closedByDisplayName", closedBy.getDisplayName());
+            }
+        } else if (conversation.getAgent() != null) {
+            metadata.put("closedByType", ParticipantType.AGENT.name());
+            if (StringUtils.hasText(conversation.getAgent().getDisplayName())) {
+                metadata.put("closedByDisplayName", conversation.getAgent().getDisplayName());
+            }
+        }
+
         ChatMessage closureNotice = ChatMessage.builder()
                 .id(UUID.randomUUID().toString())
                 .conversationId(conversationId)
@@ -274,6 +293,7 @@ public class ConversationService {
                         .build())
                 .type(ChatMessageType.SYSTEM)
                 .content(closingMessage)
+                .metadata(metadata)
                 .timestamp(now)
                 .build();
 
@@ -310,13 +330,25 @@ public class ConversationService {
     }
 
     private String resolveClosingMessage(ConversationMetadata conversation, ChatParticipant closedBy) {
-        String displayName = conversation.getAgent() != null ? conversation.getAgent().getDisplayName() : null;
-        if (closedBy != null && closedBy.getType() == ParticipantType.AGENT && StringUtils.hasText(closedBy.getDisplayName())) {
-            displayName = closedBy.getDisplayName();
+        if (closedBy != null) {
+            if (closedBy.getType() == ParticipantType.AGENT) {
+                String displayName = StringUtils.hasText(closedBy.getDisplayName())
+                        ? closedBy.getDisplayName()
+                        : "An agent";
+                return "%s closed the chat.".formatted(displayName);
+            }
+            if (closedBy.getType() == ParticipantType.CUSTOMER) {
+                String displayName = StringUtils.hasText(closedBy.getDisplayName())
+                        ? closedBy.getDisplayName()
+                        : "The customer";
+                return "%s ended the chat.".formatted(displayName);
+            }
         }
 
+        String displayName = conversation.getAgent() != null ? conversation.getAgent().getDisplayName() : null;
+
         if (StringUtils.hasText(displayName)) {
-            return String.format("%s has closed this chat. Feel free to start a new conversation if you need any more help.", displayName);
+            return "%s closed the chat.".formatted(displayName);
         }
 
         return "This conversation has been closed. You can start a new chat anytime you need assistance.";
@@ -330,6 +362,17 @@ public class ConversationService {
 
     private void releaseAssignment(String conversationId) {
         stringRedisTemplate.delete(keyFactory.conversationAssignmentKey(conversationId));
+    }
+
+    private String resolveCustomerPhone(ConversationMetadata conversation) {
+        if (conversation.getCustomer() == null || conversation.getCustomer().getMetadata() == null) {
+            return null;
+        }
+        Object value = conversation.getCustomer().getMetadata().get("phone");
+        if (value instanceof String phone && StringUtils.hasText(phone)) {
+            return phone.trim();
+        }
+        return null;
     }
 }
 

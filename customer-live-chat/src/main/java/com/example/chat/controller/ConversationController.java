@@ -18,6 +18,7 @@ import java.util.Locale;
 import java.util.Map;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.StringUtils;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -111,6 +112,18 @@ public class ConversationController {
                 : ChatMessageType.TEXT;
         ChatMessage message = conversationService.sendMessage(conversationId, sender, request.getContent(), type);
         return ResponseEntity.ok(message);
+    }
+
+    @DeleteMapping("/{conversationId}")
+    public ResponseEntity<ConversationMetadata> customerCloseConversation(
+            @PathVariable String conversationId, @RequestHeader(name = "X-Participant-Id") String customerId) {
+        if (!StringUtils.hasText(customerId)) {
+            throw new IllegalArgumentException("Customer identifier is required to close a conversation");
+        }
+
+        ChatParticipant customer = participantIdentityService.resolveCustomer(customerId, null, null, Map.of());
+        ConversationMetadata conversation = conversationService.closeConversation(conversationId, customer);
+        return ResponseEntity.ok(conversation);
     }
 }
 
