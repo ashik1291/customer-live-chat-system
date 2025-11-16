@@ -1,4 +1,4 @@
-# Customer Live Chat System
+# Customer Support Live Chat System
 
 A production-ready live chat platform composed of three applications:
 - `customer-live-chat` – Spring Boot backend with PostgreSQL, Redis/Redisson, Socket.IO, and Kafka.
