@@ -2,69 +2,73 @@
 
 ## High-Level Overview
 
-- **API Gateway (REST + WebSocket/Socket.IO)** – Entry point for web and mobile clients. The Socket.IO server runs alongside the Spring Boot app to deliver bi-directional events with fallback transports.
-- **Conversation Service** – Pure domain service responsible for starting conversations, queueing for agents, message persistence (in Redis), lifecycle transitions, and closing conversations.
-- **Redis** – Primary real-time data store.
-  - `lc:conversation:{conversationId}` → hash containing `ConversationMetadata`.
-  - `lc:conversation:{conversationId}:messages` → list of `ChatMessage` entries (JSON-serialized).
-  - `lc:queue:pending` → sorted set storing `QueueEntry` records by enqueue timestamp.
-  - `lc:agent:{agentId}:conversations` → set of conversations currently assigned to the agent.
-  - `lc:presence:{participantId}` → string of last seen timestamp (ISO-8601), expiring after `presenceTtl`.
-- **Kafka** – Event streaming backbone.
-  - `chat.lifecycle` broadcasts lifecycle events (`CONVERSATION_STARTED`, `CONVERSATION_ACCEPTED`, etc.) for downstream analytics, workflow triggers, or archival workers.
-  - `chat.messages` carries `ChatMessageEvent` for async NLP, sentiment analysis, or auditing.
-- **Pluggable Interfaces** – The module exposes `ChatAuthenticationProvider` and `ChatEventListener` extension points so host applications can hook their own authentication or event-handling logic without forking the module.
-- **Future PostgreSQL Persistence** – Introduce background workers consuming Kafka topics to persist finalized conversations/messages to Postgres. The current Redis models already serialize clean domain objects ready for storage.
+- **Backend Service (Spring Boot)** – Exposes REST for lifecycle/snapshots and hosts the Socket.IO gateway for realtime messaging and queue streaming.
+- **Conversation Service** – Orchestrates conversation lifecycle: start, queue, accept, message, close. Uses Redisson for distributed locks and Redis for ephemeral state.
+- **Redis (ephemeral source of truth)** – Stores queue, assignments, presence, and message buffers. Operations are atomic via Redisson.
+- **PostgreSQL (metadata only)** – Persists `ConversationMetadata` for reporting and durability of non-ephemeral info (ids, participants, timestamps, status).
+- **Kafka (analytics/event streaming)** – Asynchronously publishes lifecycle (`chat.lifecycle`) and message (`chat.messages`) events for BI, monitoring, or downstream processors.
+- **Pluggable Interfaces** – `ChatAuthenticationProvider`, `ChatEventListener`, and repository abstractions allow host apps to customize authentication, event handling, and storage.
 
-## Message Flow
+## Runtime Data Model (Redis Keys)
 
-1. **Client Connects**
-   - Socket.IO handshake conveys `role`, `token`, optional `conversationId`.
-   - `ChatAuthenticationProvider` resolves the actor (anonymous or authenticated).
-   - If no `conversationId`, a new conversation is created and the client joins its room.
+- `lc:conversation:{conversationId}:messages` – list of `ChatMessage` (JSON), TTL-bound.
+- `lc:queue:pending` – scored-sorted-set of conversation ids by `enqueuedAt`.
+- `lc:queue:entries` – map conversationId → `QueueEntry` (customer id, name, phone, channel, enqueuedAt).
+- `lc:presence:{participantId}` – last-seen timestamp (expiring).
+- `lc:assignment:{conversationId}` – bucket with current agent owner (TTL refreshed while active).
+- Locks: `lock:conversation:{conversationId}` and `lock:queue` for atomic lifecycle transitions.
 
-2. **FAQ / Bot Interaction (Optional)**
-   - Handled on the client or via additional services listening on Kafka. Messages sent still pass through `ConversationService.sendMessage`.
+## Ingress & Events
 
-3. **Agent Request**
-   - Client calls `POST /api/conversations/{id}/queue`. The conversation transitions to `QUEUED`, a `QueueEntry` is pushed into `lc:queue:pending`, and a lifecycle event is published.
+- REST (examples): `/api/conversations`, `/api/conversations/{id}/queue`, `/api/conversations/{id}/messages`, `/api/agent/queue`, `/api/agent/conversations/{id}/accept`, `/api/agent/conversations/{id}/close`.
+- Socket.IO:
+  - Customer/Agent conversation stream: `system:event`, `chat:message` per conversation room.
+  - Agent queue stream: `queue:snapshot` via special `scope=queue` connection.
+- Kafka topics:
+  - `chat.lifecycle`: `CONVERSATION_STARTED`, `CONVERSATION_QUEUED`, `CONVERSATION_ACCEPTED`, `MESSAGE_RECEIVED`, `CONVERSATION_CLOSED`.
+  - `chat.messages`: full message payloads for analytics/auditing (non-blocking).
 
-4. **Agent Accepts**
-   - Admin UI polls `GET /api/agent/queue`.
-   - Agent posts to `/api/agent/conversations/{id}/accept` (or uses Socket event) which removes the queue entry, assigns the agent, and emits a `CONVERSATION_ACCEPTED` event.
+## Core Flows
 
-5. **Messaging**
-   - Socket.IO `chat:message` events invoke `ConversationService.sendMessage`, which writes to Redis, updates presence, and publishes Kafka events. The message is simultaneously broadcast to the Socket.IO room.
+1. **Start conversation**
+   - REST creates metadata (PostgreSQL), marks presence (Redis), emits `CONVERSATION_STARTED` (Kafka).
+   - If using Socket.IO without `conversationId`, backend creates one and joins the room.
 
-6. **Closure**
-   - Agent triggers `/api/agent/conversations/{id}/close`. The conversation is marked `CLOSED`, queue entries are removed, and a lifecycle event is emitted.
+2. **Queue for agent**
+   - REST triggers `queueForAgent`. Under `lock:conversation:{id}`, status set to `QUEUED`, previous assignment (if any) released, queue entry added to Redis.
+   - Queue snapshot published to agents via Redis Pub/Sub → Socket.IO `queue:snapshot`.
 
-## Resilience & Scaling
+3. **Accept conversation (single winner)**
+   - Agent calls REST `accept`. Under `lock:conversation:{id}`, service uses Redis assignment bucket + queue claim to atomically grant ownership or return conflict.
+   - On success: status `ASSIGNED` (PostgreSQL), assignment TTL set, queue entry removed, emit `CONVERSATION_ACCEPTED` (Kafka), notify via `system:event` to customer and agents.
 
-- **Redis TTLs** ensure temporary conversations are not leaked. Stale presence is auto-removed.
-- **Idempotent Services** – Conversation updates always re-persist the full `ConversationMetadata`, making replays safe.
-- **Horizontal Scalability** – Multiple Spring Boot instances can run simultaneously because they all hit shared Redis and Kafka. Socket.IO rooms are isolated per node but cross-node fan-out can be added with Netty-SocketIO's pub/sub support.
-- **Backpressure** – Queue positions are tracked in Redis, allowing host apps to implement wait time estimates or deflection logic.
-- **Concurrency** – Redis atomic operations guarantee queue ordering. Kafka ensures at-least-once delivery of events for downstream consumers.
+4. **Messaging (ephemeral)**
+   - Socket.IO `chat:message` or REST message endpoint calls `sendMessage` under `lock:conversation:{id}`.
+   - Append to Redis message list, update timestamps/presence, emit `chat.messages` and `MESSAGE_RECEIVED` (Kafka), broadcast to room on `chat:message`.
 
-## Extension Points
+5. **Close conversation**
+   - Agent/customer triggers close. Under lock: write system message to Redis, set status `CLOSED` (PostgreSQL), remove queue/assignment keys, emit `CONVERSATION_CLOSED` (Kafka), notify UIs via `system:event`.
 
-- **Authentication** – Replace `DefaultChatAuthenticationProvider` with a bean that wires into SSO, OAuth, or session stores.
-- **Event Handling** – Implement `ChatEventListener` to push notifications, trigger CRM updates, or feed analytics pipelines.
-- **Storage** – Swap `ConversationRepository` with a custom implementation (e.g., composite Redis/Postgres) without touching higher-level services.
-- **Configuration** – Override `chat.*` properties for namespace isolation, TTLs, queue thresholds, Socket.IO host/port, etc.
+6. **Reconnect & snapshots**
+   - Clients reconnect Socket.IO with `conversationId` (and role). Backend rejoins room and pushes state; clients may call REST to fetch recent Redis messages to cover gaps.
 
-## Security Considerations
+## Resilience & Scalability
 
-- Enforce TLS termination and set Socket.IO to accept only secure transports in production.
-- Integrate with Spring Security to protect REST endpoints and validate agent/customer tokens.
-- Rate-limit message events per connection to defend against abuse.
-- Validate/escape message content before rendering in agent UI.
+- **Horizontal scale** – Multiple service instances share Redis/Kafka. Socket.IO rooms are node-local; fan-out is handled by publishing events to all instances which then broadcast to their connected clients.
+- **Locks & idempotency** – Redisson locks per conversation/queue enforce single-winner acceptance and consistent transitions. Assignment buckets/TTLs prevent stale ownership.
+- **TTL & cleanup** – Presence and message lists honor TTLs to avoid leaks. Queue purge is periodic and snapshot broadcasts keep agent UIs consistent.
+- **Failure modes** – If Pub/Sub is delayed, UIs fall back to REST polling. Kafka is best-effort and does not block user actions.
 
-## Operational Best Practices
+## Security
 
-- Enable Redis keyspace notifications for proactive cleanup or metrics.
-- Monitor Kafka lag for downstream persistence jobs.
-- Instrument Socket.IO connection counts and message throughput.
-- Build synthetic transactions to confirm full chat lifecycle in staging environments.
+- Terminate TLS and prefer secure WebSocket transports in production.
+- Integrate with Spring Security or upstream gateways; validate `Authorization` on REST and pass identity via Socket.IO query/headers.
+- Apply server-side message rate limits and validate content to protect UIs.
+
+## Configuration
+
+- `chat.redis.*`: key prefixes, TTLs, locks.
+- `chat.queue.*`: broadcast limits, purge thresholds, per-agent concurrency.
+- `chat.socket.*`: host/port, CORS, transports.
+- `chat.security.*`: auth providers, headers, allowed origins.
 
